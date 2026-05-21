@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+
+# Data files (large CSVs)
+data/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
