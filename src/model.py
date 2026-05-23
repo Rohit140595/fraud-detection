@@ -81,7 +81,7 @@ def time_based_split(
     return df.iloc[:split_idx], df.iloc[split_idx:]
 
 
-def select_features(model, X_train, X_test):
+def select_features(model, X_train, X_test, always_keep: list[str] | None = None):
     """
     Filter features to those with non-zero importance in a trained model.
 
@@ -90,9 +90,11 @@ def select_features(model, X_train, X_test):
     final model easier to inspect.
 
     Args:
-        model:   A trained LGBMClassifier with feature_importance_.
-        X_train: Training feature matrix.
-        X_test:  Test feature matrix.
+        model:       A trained LGBMClassifier with feature_importance_.
+        X_train:     Training feature matrix.
+        X_test:      Test feature matrix.
+        always_keep: Feature names to retain regardless of baseline importance
+                     (e.g. engineered features the baseline may have missed).
 
     Returns:
         (X_train_filtered, X_test_filtered, non_zero_features)
@@ -107,6 +109,12 @@ def select_features(model, X_train, X_test):
 
     # Features with importance == 0 were never used in any tree split — safe to drop
     non_zero_features = importance[importance['importance'] > 0]['feature'].tolist()
+
+    # Force-keep specified features even if baseline ignored them
+    if always_keep:
+        for f in always_keep:
+            if f in X_train.columns and f not in non_zero_features:
+                non_zero_features.append(f)
 
     # Slice both matrices to the surviving feature set
     X_train_filtered = X_train[non_zero_features]
