@@ -176,6 +176,30 @@ def compute_card_aggregates(
     return df
 
 
+def merge_identity(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
+    """
+    Left join identity features onto transactions.
+
+    Not all transactions have a matching identity record — unmatched rows
+    receive NaN for all identity columns, which LightGBM handles natively
+    without requiring imputation.
+
+    Args:
+        trn: Raw transaction DataFrame (must contain 'TransactionID').
+        idn: Raw identity DataFrame (must contain 'TransactionID').
+
+    Returns:
+        Merged DataFrame with identity columns appended.
+    """
+    # Left join preserves every transaction row; unmatched identity rows are dropped
+    df = pd.merge(trn, idn, on="TransactionID", how="left")
+
+    print(f"Merged            : {df.shape[0]:,} rows × {df.shape[1]} cols")
+    print(f"Identity coverage : {idn['TransactionID'].nunique() / len(trn):.1%}")
+
+    return df
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Full feature engineering pipeline.
