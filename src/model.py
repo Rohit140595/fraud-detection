@@ -81,7 +81,7 @@ def time_based_split(
     return df.iloc[:split_idx], df.iloc[split_idx:]
 
 
-def select_features(model, X_train, X_test, always_keep: list[str] | None = None):
+def select_features(model, X_train, X_test, always_keep=None):
     """
     Filter features to those with non-zero importance in a trained model.
 
