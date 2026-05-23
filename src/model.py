@@ -81,7 +81,7 @@ def time_based_split(
     return df.iloc[:split_idx], df.iloc[split_idx:]
 
 
-def select_features(model, X_train, X_test, always_keep=None):
+def select_features(model, X_train, X_test):
     """
     Filter features to those with non-zero importance in a trained model.
 
@@ -90,18 +90,15 @@ def select_features(model, X_train, X_test, always_keep=None):
     final model easier to inspect.
 
     Args:
-        model:       A trained LGBMClassifier with feature_importance_.
-        X_train:     Training feature matrix.
-        X_test:      Test feature matrix.
-        always_keep: Feature names to retain regardless of baseline importance
-                     (e.g. engineered features the baseline may have missed).
+        model:   A trained LGBMClassifier with feature_importance_.
+        X_train: Training feature matrix.
+        X_test:  Test feature matrix.
 
     Returns:
         (X_train_filtered, X_test_filtered, non_zero_features)
         Both matrices contain only the kept columns; non_zero_features is the
         list of kept column names (useful for downstream logging or re-use).
     """
-    # Build a ranked importance table from the baseline model's split counts
     importance = (
         pd.DataFrame({"feature": X_train.columns.tolist(), "importance": model.feature_importances_})
         .sort_values("importance", ascending=False)
@@ -110,17 +107,7 @@ def select_features(model, X_train, X_test, always_keep=None):
     # Features with importance == 0 were never used in any tree split — safe to drop
     non_zero_features = importance[importance['importance'] > 0]['feature'].tolist()
 
-    # Force-keep specified features even if baseline ignored them
-    if always_keep:
-        for f in always_keep:
-            if f in X_train.columns and f not in non_zero_features:
-                non_zero_features.append(f)
-
-    # Slice both matrices to the surviving feature set
-    X_train_filtered = X_train[non_zero_features]
-    X_test_filtered = X_test[non_zero_features]
-
-    return X_train_filtered, X_test_filtered, non_zero_features
+    return X_train[non_zero_features], X_test[non_zero_features], non_zero_features
 
 
 def tune_hyperparameters(
