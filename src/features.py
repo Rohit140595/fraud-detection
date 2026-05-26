@@ -12,6 +12,9 @@ from bisect import bisect_left
 import pandas as pd
 
 
+FREE_EMAIL_DOMAINS = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"}
+
+
 def add_user_proxy(df: pd.DataFrame) -> pd.DataFrame:
     """
     Create a user identity proxy from card number + billing region.
@@ -174,9 +177,6 @@ def compute_card_aggregates(
     )
 
     return df
-
-
-FREE_EMAIL_DOMAINS = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"}
 
 
 def compute_email_features(
