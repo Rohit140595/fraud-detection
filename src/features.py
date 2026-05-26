@@ -274,29 +274,33 @@ def merge_identity(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_features(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
+def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
     """
     Full feature engineering pipeline.
 
     Steps:
-      1. Merge identity features onto transactions (left join)
+      1. Merge identity features onto transactions (left join, optional)
       2. Add user proxy (card_addr)
       3. Velocity across 1h / 24h / 7d windows
       4. Amount deviation from historical mean
       5. Time features (hour of day, day of week)
       6. Card-level unique address and amount counts
+      7. Email domain features (match flag, free-provider flag)
+      8. Amount structure features (cents portion, round-number flag)
 
     Args:
         trn: Raw transaction DataFrame.
-        idn: Raw identity DataFrame.
+        idn: Optional identity DataFrame. If provided, left-joined onto transactions.
 
     Returns:
         DataFrame with all engineered features added.
     """
-    df = merge_identity(trn, idn)
+    df = merge_identity(trn, idn) if idn is not None else trn.copy()
     df = add_user_proxy(df)
     df = compute_velocity_multi_window(df)
     df = compute_amount_deviation(df)
     df = compute_time_features(df)
     df = compute_card_aggregates(df)
+    df = compute_email_features(df)
+    df = compute_amount_features(df)
     return df
