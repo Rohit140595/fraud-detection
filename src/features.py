@@ -176,6 +176,47 @@ def compute_card_aggregates(
     return df
 
 
+FREE_EMAIL_DOMAINS = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"}
+
+
+def compute_email_features(
+    df: pd.DataFrame,
+    p_col: str = "P_emaildomain",
+    r_col: str = "R_emaildomain",
+) -> pd.DataFrame:
+    """
+    Extract risk signals from purchaser and recipient email domains.
+
+    Two features:
+      email_domain_match : 1 if purchaser and recipient share the same domain.
+                           Mismatched domains can indicate account takeover or
+                           third-party purchases — higher fraud risk.
+      is_free_email      : 1 if the purchaser email is from a free provider
+                           (gmail, yahoo, hotmail, etc.). Free accounts are
+                           cheaper to create and more common in fraud.
+
+    NaN domains (no email on file) are treated as non-matching and non-free.
+
+    Args:
+        df:    DataFrame containing p_col and r_col.
+        p_col: Purchaser email domain column.
+        r_col: Recipient email domain column.
+
+    Returns:
+        DataFrame with 'email_domain_match' and 'is_free_email' columns added.
+    """
+    df = df.copy()
+    # Both sides must be non-null for a valid match; NaN == NaN would be a false positive
+    df["email_domain_match"] = (
+        df[p_col].notna() & df[r_col].notna() & (df[p_col] == df[r_col])
+    ).astype(int)
+
+    # Map purchaser domain to free-provider flag; NaN → 0
+    df["is_free_email"] = df[p_col].isin(FREE_EMAIL_DOMAINS).astype(int)
+
+    return df
+
+
 def merge_identity(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
     """
     Left join identity features onto transactions.
