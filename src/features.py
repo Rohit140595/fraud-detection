@@ -217,6 +217,39 @@ def compute_email_features(
     return df
 
 
+def compute_amount_features(
+    df: pd.DataFrame,
+    amount_col: str = "TransactionAmt",
+) -> pd.DataFrame:
+    """
+    Extract fraud signals from transaction amount structure.
+
+    Fraudsters often use amounts ending in .00 (round numbers) or
+    specific cent patterns (.99, .95) that differ from normal spending.
+
+    Two features:
+      amt_cents     : fractional part of the amount (e.g. 99.99 → 0.99).
+                      Recurring cent values can be a fraud fingerprint.
+      is_round_amt  : 1 if the amount has no cents (e.g. 100.00).
+                      Round amounts are overrepresented in card-testing fraud.
+
+    Args:
+        df:         DataFrame containing amount_col.
+        amount_col: Column with transaction amounts.
+
+    Returns:
+        DataFrame with 'amt_cents' and 'is_round_amt' columns added.
+    """
+    df = df.copy()
+    # Round to 2 decimal places first to avoid floating-point noise (e.g. 99.9999999)
+    rounded = df[amount_col].round(2)
+    df["amt_cents"] = (rounded % 1).round(2)
+    # Amount is round when cents portion is exactly zero
+    df["is_round_amt"] = (df["amt_cents"] == 0).astype(int)
+
+    return df
+
+
 def merge_identity(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
     """
     Left join identity features onto transactions.
