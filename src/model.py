@@ -142,9 +142,12 @@ def tune_hyperparameters(
         params = {
             "num_leaves":        trial.suggest_int("num_leaves", 20, 300),
             "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth":         trial.suggest_int("max_depth", 3, 12),
             "min_child_samples": trial.suggest_int("min_child_samples", 20, 200),
             "feature_fraction":  trial.suggest_float("feature_fraction", 0.5, 1.0),
             "bagging_fraction":  trial.suggest_float("bagging_fraction", 0.5, 1.0),
+            "lambda_l1":         trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
+            "lambda_l2":         trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
             "scale_pos_weight":  scale_pos_weight,
             "bagging_freq":      1,     # required for bagging_fraction to take effect
             "n_estimators":      300,   # fixed — early stopping handled in final train()
@@ -176,7 +179,11 @@ def tune_hyperparameters(
 
     # Suppress Optuna's per-trial INFO logs — progress bar is enough
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="maximize")
+    # TPESampler with fixed seed ensures the same trials are sampled every run
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     print(f"Best PR-AUC : {study.best_value:.4f}")
@@ -224,9 +231,10 @@ def train(
         eval_set=[(X_val, y_val)],
         callbacks=[
             lgb.early_stopping(50, verbose=False),
-            lgb.log_evaluation(100),
+            lgb.log_evaluation(50),  # matches early-stopping patience — always fires at least once
         ],
     )
+    print(f"Best iteration : {model.best_iteration_}")
 
     return model
 
