@@ -81,33 +81,58 @@ def time_based_split(
     return df.iloc[:split_idx], df.iloc[split_idx:]
 
 
-def select_features(model, X_train, X_test):
+def select_features(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    threshold: str = "mean",
+) -> tuple:
     """
-    Filter features to those with non-zero importance in a trained model.
+    Train a fast baseline LightGBM internally, then select features
+    whose importance meets the threshold using SelectFromModel.
 
-    LightGBM assigns zero importance to features it never used in any split.
-    Dropping them reduces noise, speeds up subsequent tuning, and makes the
-    final model easier to inspect.
+    Using 'mean' or 'median' is more principled than keeping any feature
+    with non-zero importance — it retains only features that contribute
+    meaningfully relative to the average, reducing overfitting noise.
 
     Args:
-        model:   A trained LGBMClassifier with feature_importance_.
-        X_train: Training feature matrix.
-        X_test:  Test feature matrix.
+        X_train:   Training feature matrix.
+        y_train:   Training labels.
+        X_test:    Test feature matrix.
+        threshold: Importance cutoff — 'mean', 'median', or a float.
+                   'mean' keeps features above average importance (recommended).
+                   'median' is more aggressive, keeping the top 50%.
 
     Returns:
-        (X_train_filtered, X_test_filtered, non_zero_features)
-        Both matrices contain only the kept columns; non_zero_features is the
-        list of kept column names (useful for downstream logging or re-use).
+        (X_train_filtered, X_test_filtered, selected_feature_names)
     """
-    importance = (
-        pd.DataFrame({"feature": X_train.columns.tolist(), "importance": model.feature_importances_})
-        .sort_values("importance", ascending=False)
+    from sklearn.feature_selection import SelectFromModel
+
+    neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
+
+    # Fast baseline — just enough trees to estimate stable feature importances
+    baseline = lgb.LGBMClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        num_leaves=64,
+        scale_pos_weight=neg / pos,
+        random_state=42,
+        n_jobs=-1,
+        verbose=-1,
     )
 
-    # Features with importance == 0 were never used in any tree split — safe to drop
-    non_zero_features = importance[importance['importance'] > 0]['feature'].tolist()
+    # SelectFromModel fits the baseline and applies the importance threshold
+    selector = SelectFromModel(baseline, threshold=threshold)
+    selector.fit(X_train, y_train)
 
-    return X_train[non_zero_features], X_test[non_zero_features], non_zero_features
+    # Boolean mask → column names from original DataFrame
+    support = selector.get_support()
+    selected_features = X_train.columns[support].tolist()
+
+    print(f"Features kept   : {len(selected_features)} / {X_train.shape[1]}")
+    print(f"Features dropped: {X_train.shape[1] - len(selected_features)}")
+
+    return X_train[selected_features], X_test[selected_features], selected_features
 
 
 def tune_hyperparameters(
