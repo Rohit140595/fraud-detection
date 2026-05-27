@@ -10,6 +10,7 @@ Both are computed in a leak-free way — only prior transactions are used.
 
 from bisect import bisect_left
 import pandas as pd
+import numpy as np
 
 
 FREE_EMAIL_DOMAINS = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"}
@@ -246,6 +247,40 @@ def compute_amount_features(
     df["amt_cents"] = (rounded % 1).round(2)
     # Amount is round when cents portion is exactly zero
     df["is_round_amt"] = (df["amt_cents"] == 0).astype(int)
+
+    return df
+
+
+def compute_d_features(
+    df: pd.DataFrame,
+    d_col: str = "D1",
+) -> pd.DataFrame:
+    """
+    Engineer features from D1 — days since the cardholder's last transaction.
+
+    D1 is right-skewed (most cardholders transact recently; outliers are very
+    large). Log-transforming compresses the scale so LightGBM splits are more
+    evenly distributed.
+
+    Two features:
+      log_d1      : log1p(D1) — compressed scale, preserves zero.
+      d1_null_flag: 1 when D1 is missing (no prior transaction on record).
+                    NaN and a genuinely dormant card are different signals —
+                    this flag lets the model distinguish them.
+
+    Args:
+        df:    DataFrame containing d_col.
+        d_col: Column with days-since-last-transaction values (default 'D1').
+
+    Returns:
+        DataFrame with 'log_d1' and 'd1_null_flag' columns added.
+    """
+    df = df.copy()
+    # Flag missing D1 before the transform — log1p(-1) = -inf, not NaN,
+    # so checking the transformed column would silently miss invalid negatives
+    df["d1_null_flag"] = df[d_col].isnull().astype(int)
+    # log1p compresses the right tail while keeping log1p(0) = 0
+    df["log_d1"] = np.log1p(df[d_col])
 
     return df
 
