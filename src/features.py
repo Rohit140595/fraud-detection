@@ -322,6 +322,7 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
       6. Card-level unique address and amount counts
       7. Email domain features (match flag, free-provider flag)
       8. Amount structure features (cents portion, round-number flag)
+      9. D1 features (log-transform, null flag)
 
     Args:
         trn: Raw transaction DataFrame.
@@ -338,4 +339,5 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
     df = compute_card_aggregates(df)
     df = compute_email_features(df)
     df = compute_amount_features(df)
+    df = compute_d_features(df)
     return df
