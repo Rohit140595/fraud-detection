@@ -341,13 +341,32 @@ def plot_feature_importance(
     plt.show()
 
 
-def save_model(model: lgb.LGBMClassifier, path: Path = MODEL_PATH) -> None:
-    """Persist the trained model to disk for use by the serving layer."""
+def save_model(
+    model: lgb.LGBMClassifier,
+    cat_features: list[str],
+    path: Path = MODEL_PATH,
+) -> None:
+    """
+    Persist the trained model and categorical feature names to disk.
+
+    Saving cat_features alongside the model ensures the serving layer
+    can cast the right columns to 'category' dtype at inference time,
+    matching exactly what LightGBM saw during training.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, path)
-    print(f"Model saved to {path}")
+    joblib.dump({"model": model, "cat_features": cat_features}, path)
+    print(f"Model saved to {path}  ({len(cat_features)} categorical features)")
 
 
-def load_model(path: Path = MODEL_PATH) -> lgb.LGBMClassifier:
-    """Load a persisted model from disk."""
-    return joblib.load(path)
+def load_model(path: Path = MODEL_PATH) -> tuple[lgb.LGBMClassifier, list[str]]:
+    """
+    Load a persisted model and its categorical feature names from disk.
+
+    Returns:
+        (model, cat_features) — both needed for correct inference.
+    """
+    data = joblib.load(path)
+    if isinstance(data, dict):
+        return data["model"], data["cat_features"]
+    # backward compatibility — old saves without cat_features
+    return data, []

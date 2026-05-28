@@ -276,6 +276,8 @@ def compute_d_features(
         DataFrame with 'log_d1' and 'd1_null_flag' columns added.
     """
     df = df.copy()
+    # Coerce to float first — None (from API) becomes NaN, which log1p handles cleanly
+    df[d_col] = pd.to_numeric(df[d_col], errors="coerce")
     # Flag missing D1 before the transform — log1p(-1) = -inf, not NaN,
     # so checking the transformed column would silently miss invalid negatives
     df["d1_null_flag"] = df[d_col].isnull().astype(int)
