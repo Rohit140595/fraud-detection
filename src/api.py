@@ -8,8 +8,11 @@ Design decisions:
     Defaults to zero/None so the endpoint works without a history store.
   - Static features (time, email, amount, D1) are computed server-side from raw inputs —
     they require no historical context and are cheap to recompute.
-  - _coerce_dtypes runs before feature engineering: a single None in an optional field
-    causes pandas to infer object dtype, which LightGBM rejects.
+  - TransactionRequest uses extra='allow' so payment-processor features (V/C/M columns)
+    can be forwarded without declaring every field explicitly. model_dump() captures
+    them all and passes them through to the model via reindex.
+  - _coerce_dtypes coerces all non-string columns to float64 — a None in any optional
+    field causes pandas to infer object dtype, which LightGBM rejects.
   - cat_features saved alongside the model ensures the serving layer casts exactly
     the same columns to 'category' dtype that were used during training.
 """
@@ -18,7 +21,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 import pandas as pd
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from src.model import load_model
 from src.features import (
@@ -27,34 +30,20 @@ from src.features import (
     compute_d_features,
 )
 
-# Columns that must be numeric dtype in the inference DataFrame.
-# Optional fields default to None, which causes pandas to infer object dtype
-# for those columns in a single-row DataFrame — LightGBM rejects non-numeric dtypes.
-_NUMERIC_COLS = [
-    "TransactionAmt", "card1", "addr1", "TransactionDT",
-    "velocity_1h", "velocity_24h", "velocity_7d",
-    "hist_mean_amt", "amt_deviation",
-    "card_unique_addr", "card_unique_amt", "D1",
-]
+# String columns that must stay as object/category — everything else is numeric
+_STRING_COLS = {"ProductCD", "card4", "card6", "P_emaildomain", "R_emaildomain"}
 
 
 def _coerce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Cast numeric columns to float64, converting None → NaN.
+    Cast all non-string columns to float64, converting None → NaN.
 
-    Pydantic validates request types; this step fixes a downstream pandas artifact.
-    When a single-row DataFrame is built from a dict containing None, pandas cannot
-    infer the dtype and falls back to object. pd.to_numeric(..., errors='coerce')
-    converts None/non-numeric values to NaN and returns float64, which LightGBM accepts.
-
-    Args:
-        df: Single-row DataFrame built from the incoming request dict.
-
-    Returns:
-        DataFrame with all _NUMERIC_COLS cast to float64.
+    A single None in a column makes pandas infer object dtype for that column.
+    Coercing everything except known string columns ensures LightGBM receives
+    correct numeric dtypes regardless of which extra fields are passed.
     """
-    for col in _NUMERIC_COLS:
-        if col in df.columns:
+    for col in df.columns:
+        if col not in _STRING_COLS:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
@@ -89,7 +78,13 @@ class TransactionRequest(BaseModel):
       - Behavioral features: pre-computed by the caller from transaction history
         (e.g., a Redis lookup). Defaulted to 0/None so the endpoint works without
         a history store, at the cost of slightly less accurate scores.
+
+    extra='allow' lets payment-processor features (V/C/M columns) pass through
+    without declaring each one explicitly. They are captured by model_dump() and
+    forwarded to the model via reindex in the predict endpoint.
     """
+    model_config = ConfigDict(extra='allow')
+    
     # Core fields — required
     TransactionAmt: float
     card1:          int
@@ -158,25 +153,9 @@ def predict(request: TransactionRequest):
     Returns:
         PredictResponse with fraud_probability, is_fraud, and threshold.
     """
-    # 1. Flatten request into a dict — single source of truth before DataFrame creation
-    features_dict = {
-        "TransactionAmt":   request.TransactionAmt,
-        "card1":            request.card1,
-        "addr1":            request.addr1,
-        "TransactionDT":    request.TransactionDT,
-        "ProductCD":        request.ProductCD,
-        "card4":            request.card4,
-        "card6":            request.card6,
-        "P_emaildomain":    request.P_emaildomain,
-        "R_emaildomain":    request.R_emaildomain,
-        "D1":               request.D1,
-        "velocity_1h":      request.velocity_1h,
-        "velocity_24h":     request.velocity_24h,
-        "velocity_7d":      request.velocity_7d,
-        "hist_mean_amt":    request.hist_mean_amt,
-        "card_unique_addr": request.card_unique_addr,
-        "card_unique_amt":  request.card_unique_amt,
-    }
+    # 1. Flatten request into a dict via model_dump() — captures declared fields AND
+    # any extra fields (V/C/M columns) passed through by the caller.
+    features_dict = request.model_dump()
 
     # 2. Amount deviation — how far this transaction is from the user's historical mean.
     # If no history is available, fall back to the current amount so deviation = 0.
