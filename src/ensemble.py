@@ -19,6 +19,8 @@ Design decisions:
     model.py and ignore this module entirely.
 """
 
+from __future__ import annotations
+
 import joblib
 from pathlib import Path
 from typing import Optional

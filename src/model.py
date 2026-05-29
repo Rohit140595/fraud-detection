@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Data preparation and feature selection for real-time fraud detection.
 
