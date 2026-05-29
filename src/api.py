@@ -2,19 +2,19 @@
 FastAPI serving layer for real-time fraud detection.
 
 Design decisions:
-  - Model loaded once at startup via lifespan — avoids per-request disk I/O.
+  - Ensemble loaded once at startup via lifespan — avoids per-request disk I/O.
   - Behavioral features (velocity, hist_mean_amt, card aggregates) are caller-supplied:
     the API has no database, so the caller is responsible for fetching history.
     Defaults to zero/None so the endpoint works without a history store.
-  - Static features (time, email, amount, D1) are computed server-side from raw inputs —
-    they require no historical context and are cheap to recompute.
+  - Static features (time, email, amount, D columns) are computed server-side from
+    raw inputs — they require no historical context and are cheap to recompute.
   - TransactionRequest uses extra='allow' so payment-processor features (V/C/M columns)
     can be forwarded without declaring every field explicitly. model_dump() captures
-    them all and passes them through to the model via reindex.
+    them all and passed through to the ensemble via reindex.
   - _coerce_dtypes coerces all non-string columns to float64 — a None in any optional
-    field causes pandas to infer object dtype, which LightGBM rejects.
-  - cat_features saved alongside the model ensures the serving layer casts exactly
-    the same columns to 'category' dtype that were used during training.
+    field causes pandas to infer object dtype, which models reject at inference time.
+  - cat_cols saved alongside the ensemble ensures the serving layer ordinal-encodes
+    exactly the same columns with the same codes used during training.
 """
 
 from contextlib import asynccontextmanager
@@ -23,14 +23,14 @@ import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict
 
-from src.model import load_model
+from src.ensemble import load_ensemble
 from src.features import (
     add_user_proxy, compute_time_features,
     compute_email_features, compute_amount_features,
-    compute_d_features,
+    compute_d_features, compute_identity_features,
 )
 
-# String columns that must stay as object/category — everything else is numeric
+# String columns that must stay as object — everything else is numeric
 _STRING_COLS = {"ProductCD", "card4", "card6", "P_emaildomain", "R_emaildomain"}
 
 
@@ -39,7 +39,7 @@ def _coerce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     Cast all non-string columns to float64, converting None → NaN.
 
     A single None in a column makes pandas infer object dtype for that column.
-    Coercing everything except known string columns ensures LightGBM receives
+    Coercing everything except known string columns ensures all models receive
     correct numeric dtypes regardless of which extra fields are passed.
     """
     for col in df.columns:
@@ -52,13 +52,13 @@ def _coerce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Load the model once at startup and attach it to app.state.
+    Load the ensemble once at startup and attach it to app.state.
 
-    Loading inside lifespan (not at module import time) means the model is only
+    Loading inside lifespan (not at module import time) means the ensemble is only
     read from disk once per server process, and the app fails fast on startup if
     the model file is missing — rather than failing silently on the first request.
     """
-    app.state.model, app.state.cat_features = load_model()
+    app.state.models, app.state.cat_cols = load_ensemble()
     yield
 
 
@@ -74,17 +74,17 @@ class TransactionRequest(BaseModel):
       - Core fields: always required — minimum needed to construct the user proxy
         and run feature engineering.
       - Optional raw fields: present in the original dataset but not always
-        available at inference time; missing values are handled by the model.
+        available at inference time; missing values are handled by the models.
       - Behavioral features: pre-computed by the caller from transaction history
         (e.g., a Redis lookup). Defaulted to 0/None so the endpoint works without
         a history store, at the cost of slightly less accurate scores.
 
     extra='allow' lets payment-processor features (V/C/M columns) pass through
     without declaring each one explicitly. They are captured by model_dump() and
-    forwarded to the model via reindex in the predict endpoint.
+    forwarded to the ensemble via reindex in the predict endpoint.
     """
     model_config = ConfigDict(extra='allow')
-    
+
     # Core fields — required
     TransactionAmt: float
     card1:          int
@@ -113,8 +113,8 @@ class PredictResponse(BaseModel):
     """
     Fraud score returned for a single transaction.
 
-    fraud_probability: raw model output from predict_proba — useful for ranking
-                       or applying a custom threshold downstream.
+    fraud_probability: soft-vote average of predict_proba across all ensemble models —
+                       useful for ranking or applying a custom threshold downstream.
     is_fraud:          binary decision at the default 0.5 threshold.
     threshold:         threshold used to derive is_fraud, returned explicitly so
                        the caller knows what operating point was applied.
@@ -134,18 +134,18 @@ def health():
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: TransactionRequest):
     """
-    Score a single transaction for fraud.
+    Score a single transaction for fraud using the soft-voting ensemble.
 
     Pipeline:
-      1. Build a flat feature dict from the request fields.
+      1. Flatten request fields into a dict (includes V/C/M passthrough columns).
       2. Compute amt_deviation from hist_mean_amt (falls back to current amount
          if no history is available, giving a deviation of 0).
       3. Create a single-row DataFrame and coerce numeric dtypes (None → NaN).
       4. Run static feature engineering: user proxy, time, email, amount, D1.
-      5. Align columns to the model's expected feature set (reindex fills gaps with NaN).
-      6. Cast categorical columns to 'category' dtype — must match training dtype
-         exactly or LightGBM raises a categorical_feature mismatch error.
-      7. Score and return fraud_probability + is_fraud decision.
+      5. Ordinal-encode categorical columns using the codes saved at training time.
+      6. Align columns to the ensemble's expected feature set (reindex fills gaps
+         with NaN — all three models handle NaN natively).
+      7. Average predict_proba across LightGBM, XGBoost, and CatBoost (soft vote).
 
     Args:
         request: Validated TransactionRequest payload.
@@ -153,41 +153,45 @@ def predict(request: TransactionRequest):
     Returns:
         PredictResponse with fraud_probability, is_fraud, and threshold.
     """
-    # 1. Flatten request into a dict via model_dump() — captures declared fields AND
-    # any extra fields (V/C/M columns) passed through by the caller.
+    # 1. Flatten request — captures declared fields AND extra V/C/M columns.
     features_dict = request.model_dump()
 
     # 2. Amount deviation — how far this transaction is from the user's historical mean.
-    # If no history is available, fall back to the current amount so deviation = 0.
     hist = features_dict["hist_mean_amt"] or features_dict["TransactionAmt"]
     features_dict["amt_deviation"] = features_dict["TransactionAmt"] - hist
 
-    # 3. Build DataFrame and fix dtype inference before any feature engineering
+    # 3. Build DataFrame and fix dtype inference before feature engineering.
     df = pd.DataFrame([features_dict])
-    df = _coerce_dtypes(df)   # None → NaN; prevents object-typed numeric columns
+    df = _coerce_dtypes(df)
 
-    # 4. Static feature engineering — mirrors the training pipeline in features.py
-    df = add_user_proxy(df)          # card_addr = card1 + addr1 user identity proxy
-    df = compute_time_features(df)   # hour_of_day, day_of_week from TransactionDT
-    df = compute_email_features(df)  # email_domain_match, is_free_email
-    df = compute_amount_features(df) # amt_cents, is_round_amt
-    df = compute_d_features(df)      # log_d1, d1_null_flag
+    # 4. Static feature engineering — mirrors the training pipeline in features.py.
+    df = add_user_proxy(df)
+    df = compute_time_features(df)
+    df = compute_email_features(df)
+    df = compute_amount_features(df)
+    df = compute_d_features(df)
+    df = compute_identity_features(df)
 
-    # 5. Align to the exact feature set the model was trained on.
-    # reindex fills any column the model expects but the request didn't supply with NaN —
-    # LightGBM handles NaN natively, so no imputation step is needed here.
-    df = df.reindex(columns=app.state.model.feature_names_in_)
-
-    # 6. Cast categorical columns to 'category' dtype.
-    # app.state.cat_features is the list saved alongside the model at training time,
-    # ensuring we cast exactly the same columns and avoid a LightGBM dtype mismatch.
-    for col in app.state.cat_features:
+    # 5. Ordinal-encode categoricals — must match the codes used during training.
+    for col in app.state.cat_cols:
         if col in df.columns:
-            df[col] = df[col].astype("category")
+            df[col] = df[col].astype("category").cat.codes
 
-    # 7. Score
-    fraud_probability = float(app.state.model.predict_proba(df)[0, 1])
-    is_fraud = bool(app.state.model.predict(df)[0])
+    # 6 & 7. Score: average predict_proba across all ensemble models (soft vote).
+    lgbm_m, xgb_m, cat_m = app.state.models
+
+    lgbm_df = df.reindex(columns=lgbm_m.feature_names_in_)
+    xgb_df  = df.reindex(columns=xgb_m.feature_names_in_)
+    cat_df  = df.reindex(columns=cat_m.feature_names_)
+
+    prob = (
+        lgbm_m.predict_proba(lgbm_df)[0, 1]
+        + xgb_m.predict_proba(xgb_df)[0, 1]
+        + cat_m.predict_proba(cat_df)[0, 1]
+    ) / 3.0
+
+    fraud_probability = float(prob)
+    is_fraud = bool(fraud_probability >= 0.5)
 
     return PredictResponse(
         fraud_probability=fraud_probability,

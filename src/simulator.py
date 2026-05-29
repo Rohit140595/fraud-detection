@@ -12,14 +12,17 @@ import time
 import requests
 
 # Columns to exclude from the payload — isFraud is the label, the rest are
-# computed server-side by the API's feature engineering pipeline
+# computed server-side by the API's feature engineering pipeline.
+# D column names follow the pattern log_D{n} / D{n}_null_flag (uppercase D).
 _EXCLUDE_COLS = {
     "isFraud", "card_addr",
-    "hour_of_day", "day_of_week",
+    "hour_of_day", "day_of_week", "is_night", "is_weekend", "month_of_year",
     "email_domain_match", "is_free_email",
     "amt_cents", "is_round_amt",
-    "log_d1", "d1_null_flag",
     "amt_deviation",
+    "is_unknown_os", "is_mobile", "device_os",
+    *[f"log_D{i}" for i in range(1, 10)],
+    *[f"D{i}_null_flag" for i in range(1, 10)],
 }
 
 def load_test_sample(df: pd.DataFrame, n: int, random_state: int = 414) -> pd.DataFrame:
