@@ -21,6 +21,7 @@ Design decisions:
 
 import joblib
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import optuna
@@ -29,7 +30,10 @@ import xgboost as xgb
 from catboost import CatBoostClassifier
 import matplotlib.pyplot as plt
 import pandas as pd
-from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
+from sklearn.calibration import calibration_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import auc, brier_score_loss, precision_recall_curve, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
 
@@ -346,25 +350,183 @@ def evaluate_ensemble(
     return {"pr_auc": pr_auc, "roc_auc": roc_auc}
 
 
+def calibrate_ensemble(
+    models: dict,
+    X_cal: pd.DataFrame,
+    y_cal: pd.Series,
+    method: str = "isotonic",
+) -> IsotonicRegression | LogisticRegression:
+    """
+    Fit a post-hoc calibrator on raw ensemble scores from the calibration set.
+
+    Boosted tree ensembles tend to produce overconfident probabilities (pushed
+    toward 0 and 1). Isotonic regression corrects this by learning a monotone
+    mapping from raw scores → calibrated probabilities.
+
+    The calibration set must be independent of model training and early stopping
+    (i.e., the dedicated cal split, not the train or test sets).
+
+    Args:
+        models:  Dict from train_ensemble.
+        X_cal:   Calibration features (integer-encoded, same schema as training).
+        y_cal:   Calibration labels.
+        method:  'isotonic' (default) or 'sigmoid' (Platt scaling).
+                 Isotonic is non-parametric and more flexible; sigmoid assumes
+                 a logistic relationship between raw score and true probability.
+
+    Returns:
+        Fitted calibrator (IsotonicRegression or LogisticRegression).
+    """
+    raw_probs = predict_proba_ensemble(models, X_cal)
+
+    if method == "isotonic":
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(raw_probs, y_cal)
+    else:  # sigmoid / Platt
+        calibrator = LogisticRegression()
+        calibrator.fit(raw_probs.reshape(-1, 1), y_cal)
+
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+    cal_probs = (
+        calibrator.predict(raw_probs) if method == "isotonic"
+        else calibrator.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
+    )
+    brier_before = brier_score_loss(y_cal, raw_probs)
+    brier_after  = brier_score_loss(y_cal, cal_probs)
+    print(f"Brier score  before calibration : {brier_before:.4f}")
+    print(f"Brier score  after  calibration : {brier_after:.4f}  ({method})")
+
+    # Reliability diagram
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for probs, label, style in [
+        (raw_probs, "Before calibration", "--"),
+        (cal_probs, f"After calibration ({method})", "-"),
+    ]:
+        frac_pos, mean_pred = calibration_curve(y_cal, probs, n_bins=15, strategy="quantile")
+        ax.plot(mean_pred, frac_pos, marker="o", linestyle=style, label=label)
+    ax.plot([0, 1], [0, 1], "k:", label="Perfect calibration")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Fraction of positives")
+    ax.set_title("Reliability diagram")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return calibrator
+
+
+def tune_threshold(
+    y_true: pd.Series,
+    y_prob: np.ndarray,
+    beta: float = 2.0,
+) -> dict:
+    """
+    Find the decision threshold that maximises F-beta on calibrated probabilities.
+
+    F-beta weights recall beta² times more than precision. beta=2 means missing
+    fraud (false negative) is penalised 4× more than a false alarm (false positive),
+    which reflects the typical cost asymmetry in fraud detection.
+
+    Also plots the precision-recall curve and F-beta curve so the operating point
+    can be inspected visually before committing to a threshold.
+
+    Args:
+        y_true: True binary labels.
+        y_prob: Calibrated fraud probabilities (output of calibrator.predict).
+        beta:   F-beta weight (default 2.0).
+
+    Returns:
+        Dict with threshold, precision, recall, f_beta at the optimal point.
+    """
+    precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
+
+    # F-beta is undefined when precision + recall = 0; add epsilon to avoid /0
+    denom  = beta**2 * precision[:-1] + recall[:-1]
+    f_beta = np.where(
+        denom > 0,
+        (1 + beta**2) * precision[:-1] * recall[:-1] / denom,
+        0.0,
+    )
+
+    best_idx   = int(np.argmax(f_beta))
+    best       = {
+        "threshold": float(thresholds[best_idx]),
+        "precision": float(precision[best_idx]),
+        "recall":    float(recall[best_idx]),
+        "f_beta":    float(f_beta[best_idx]),
+    }
+
+    print(f"Optimal threshold (F{beta:.0f}) : {best['threshold']:.4f}")
+    print(f"  Precision : {best['precision']:.4f}")
+    print(f"  Recall    : {best['recall']:.4f}")
+    print(f"  F{beta:.0f}       : {best['f_beta']:.4f}")
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    # PR curve
+    pr_auc = auc(recall, precision)
+    axes[0].plot(recall, precision, color="steelblue", lw=2,
+                 label=f"PR-AUC = {pr_auc:.4f}")
+    axes[0].scatter(best["recall"], best["precision"],
+                    color="tomato", zorder=5, s=100,
+                    label=f"Optimal threshold = {best['threshold']:.4f}")
+    axes[0].axhline(y_true.mean(), color="grey", linestyle="--",
+                    label=f"Baseline ({y_true.mean():.2%})")
+    axes[0].set_xlabel("Recall")
+    axes[0].set_ylabel("Precision")
+    axes[0].set_title("Precision-Recall Curve")
+    axes[0].legend()
+
+    # F-beta curve
+    axes[1].plot(thresholds, f_beta, color="seagreen", lw=2)
+    axes[1].axvline(best["threshold"], color="tomato", linestyle="--",
+                    label=f"Optimal = {best['threshold']:.4f}")
+    axes[1].set_xlabel("Threshold")
+    axes[1].set_ylabel(f"F{beta:.0f} score")
+    axes[1].set_title(f"F{beta:.0f} vs Threshold")
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    return best
+
+
 def save_ensemble(
     models: dict,
     cat_cols: list[str],
     cat_encoders: dict,
+    calibrator: Optional[object] = None,
+    threshold: float = 0.5,
     path: Path = ENSEMBLE_PATH,
 ) -> None:
-    """Persist the ensemble, cat_cols, and cat_encoders to disk."""
+    """Persist the ensemble, cat_cols, cat_encoders, calibrator, and threshold to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"models": models, "cat_cols": cat_cols, "cat_encoders": cat_encoders}, path)
-    print(f"Ensemble saved to {path}  ({len(models)} models)")
+    joblib.dump({
+        "models":      models,
+        "cat_cols":    cat_cols,
+        "cat_encoders": cat_encoders,
+        "calibrator":  calibrator,
+        "threshold":   threshold,
+    }, path)
+    print(f"Ensemble saved to {path}  ({len(models)} models, threshold={threshold:.4f})")
 
 
-def load_ensemble(path: Path = ENSEMBLE_PATH) -> tuple[dict, list[str], dict]:
+def load_ensemble(path: Path = ENSEMBLE_PATH) -> tuple:
     """
     Load a persisted ensemble from disk.
 
     Returns:
-        (models, cat_cols, cat_encoders)
-        cat_encoders: {col: {label: int_code}} for consistent inference-time encoding.
+        (models, cat_cols, cat_encoders, calibrator, threshold)
+        calibrator: fitted IsotonicRegression / LogisticRegression, or None.
+        threshold:  saved decision threshold (defaults to 0.5 if not present).
     """
     data = joblib.load(path)
-    return data["models"], data["cat_cols"], data.get("cat_encoders", {})
+    return (
+        data["models"],
+        data["cat_cols"],
+        data.get("cat_encoders", {}),
+        data.get("calibrator", None),
+        data.get("threshold", 0.5),
+    )

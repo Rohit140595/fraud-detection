@@ -59,7 +59,8 @@ async def lifespan(app: FastAPI):
     read from disk once per server process, and the app fails fast on startup if
     the model file is missing — rather than failing silently on the first request.
     """
-    app.state.models, app.state.cat_cols, app.state.cat_encoders = load_ensemble()
+    (app.state.models, app.state.cat_cols, app.state.cat_encoders,
+     app.state.calibrator, app.state.threshold) = load_ensemble()
     yield
 
 
@@ -198,17 +199,22 @@ def predict(request: TransactionRequest):
         if col in cat_df.columns:
             cat_df[col] = cat_df[col].fillna(-1).astype(int)
 
-    prob = (
+    raw_prob = (
         lgbm_m.predict_proba(lgbm_df)[0, 1]
         + xgb_m.predict_proba(xgb_df)[0, 1]
         + cat_m.predict_proba(cat_df)[0, 1]
     ) / 3.0
 
-    fraud_probability = float(prob)
-    is_fraud = bool(fraud_probability >= 0.5)
+    # 8. Apply calibration if a calibrator was saved with the model.
+    if app.state.calibrator is not None:
+        fraud_probability = float(app.state.calibrator.predict([raw_prob])[0])
+    else:
+        fraud_probability = float(raw_prob)
+
+    is_fraud = bool(fraud_probability >= app.state.threshold)
 
     return PredictResponse(
         fraud_probability=fraud_probability,
         is_fraud=is_fraud,
-        threshold=0.5,
+        threshold=app.state.threshold,
     )
