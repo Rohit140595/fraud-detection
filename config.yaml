@@ -1,0 +1,18 @@
+random_state: 42
+
+paths:
+  lgbm_model: models/lgbm_fraud.pkl
+  ensemble:   models/ensemble_fraud.pkl
+  shap_cache: models/shap_features.json
+
+feature_selection:
+  top_n: 40
+  sample_size: 50000
+
+tuning:
+  n_trials: 50
+  n_cv_splits: 5
+
+ensemble:
+  use_ensemble: true
+  threshold: 0.5

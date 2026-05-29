@@ -12,9 +12,17 @@ from bisect import bisect_left
 import pandas as pd
 import numpy as np
 
-
 FREE_EMAIL_DOMAINS = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"}
 
+# Identity columns id_01–id_38 from the Vesta identity dataset
+_ID_COLS = [f"id_{i:02d}" for i in range(1, 39)]
+
+# id columns with zero importance in the trained model — confirmed noise.
+# Dropped early to reduce feature space before SelectFromModel runs.
+_WEAK_ID_COLS = {
+    "id_01", "id_03", "id_04", "id_09", "id_10",
+    "id_14", "id_15", "id_18", "id_19", "id_30", "id_38",
+}
 
 def add_user_proxy(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -82,14 +90,26 @@ def compute_time_features(
     day-of-week directly.
 
     Adds:
-        hour_of_day  : 0–23
-        day_of_week  : 0–6  (0 = Monday relative to reference)
+        hour_of_day   : 0–23
+        day_of_week   : 0–6  (0 = Monday relative to reference)
+        is_night      : 1 if hour_of_day is 0–5 (midnight to 5am)
+        is_weekend    : 1 if day_of_week is 5 or 6 (Saturday/Sunday)
+        month_of_year : 0–11, approximate month index using 30-day months.
+                        Captures seasonal fraud patterns without leaking the
+                        absolute timestamp into the model.
     """
     df = df.copy()
     # Integer division to seconds → hours → modulo for 24-hour cycle
     df["hour_of_day"] = (df[time_col] // 3600) % 24
     # 86400 seconds per day; modulo 7 gives day index within the week
     df["day_of_week"] = (df[time_col] // 86400) % 7
+    # Fraud is more common in off-hours when monitoring is lighter
+    df["is_night"] = (df["hour_of_day"].between(0, 5)).astype(int)
+    # 1 on Saturday/Sunday — weekend fraud patterns differ from weekday
+    df["is_weekend"] = (df["day_of_week"].isin([5, 6])).astype(int)
+    # Approximate month index (0–11) using 30-day months relative to reference.
+    # Captures seasonal fraud patterns without leaking the absolute timestamp.
+    df["month_of_year"] = (df[time_col] // (86400 * 30)) % 12
     return df
 
 
@@ -253,36 +273,120 @@ def compute_amount_features(
 
 def compute_d_features(
     df: pd.DataFrame,
-    d_col: str = "D1",
+    d_col_list: list = ['D' + str(x) for x in range(1, 10)],
 ) -> pd.DataFrame:
     """
-    Engineer features from D1 — days since the cardholder's last transaction.
+    Engineer log-transform and null-flag features for D1–D9 (days-since columns).
 
-    D1 is right-skewed (most cardholders transact recently; outliers are very
-    large). Log-transforming compresses the scale so LightGBM splits are more
-    evenly distributed.
+    D columns are right-skewed — most cardholders transact recently but outliers
+    can be very large. Log-transforming compresses the scale so LightGBM splits
+    are more evenly distributed. Columns absent from the DataFrame are silently
+    skipped — safe for API inference where only D1 is supplied.
 
-    Two features:
-      log_d1      : log1p(D1) — compressed scale, preserves zero.
-      d1_null_flag: 1 when D1 is missing (no prior transaction on record).
-                    NaN and a genuinely dormant card are different signals —
-                    this flag lets the model distinguish them.
+    For each D column present, adds two features:
+      log_{d}      : log1p(D) — compressed scale, preserves zero.
+      {d}_null_flag: 1 when D is missing (no prior transaction on record).
+                     NaN and a genuinely dormant card are different signals —
+                     this flag lets the model distinguish them.
 
     Args:
-        df:    DataFrame containing d_col.
-        d_col: Column with days-since-last-transaction values (default 'D1').
+        df:         DataFrame that may contain any subset of d_col_list.
+        d_col_list: D columns to process (default D1–D9).
 
     Returns:
-        DataFrame with 'log_d1' and 'd1_null_flag' columns added.
+        DataFrame with log_{d} and {d}_null_flag columns added for each
+        D column present in the input.
     """
     df = df.copy()
-    # Coerce to float first — None (from API) becomes NaN, which log1p handles cleanly
-    df[d_col] = pd.to_numeric(df[d_col], errors="coerce")
-    # Flag missing D1 before the transform — log1p(-1) = -inf, not NaN,
-    # so checking the transformed column would silently miss invalid negatives
-    df["d1_null_flag"] = df[d_col].isnull().astype(int)
-    # log1p compresses the right tail while keeping log1p(0) = 0
-    df["log_d1"] = np.log1p(df[d_col])
+    for d_col in d_col_list:
+        if d_col not in df.columns:
+            continue
+        # Coerce to float first — None (from API) becomes NaN, which log1p handles cleanly
+        df[d_col] = pd.to_numeric(df[d_col], errors="coerce")
+        # Flag missing D1 before the transform — log1p(-1) = -inf, not NaN,
+        # so checking the transformed column would silently miss invalid negatives
+        null_col = d_col + '_null_flag'
+        df[null_col] = df[d_col].isnull().astype(int)
+        # log1p compresses the right tail while keeping log1p(0) = 0
+        log_col = 'log_' + d_col
+        df[log_col] = np.log1p(df[d_col])
+
+    return df
+
+
+def _extract_os(device_info) -> str:
+    """
+    Map a raw DeviceInfo string to a coarse OS category.
+
+    Returns None for missing DeviceInfo so the resulting device_os column
+    contains NaN — LightGBM handles NaN natively and treats it differently
+    from a real category value, avoiding the dominant 'unknown' sentinel
+    that previously distorted splits.
+    """
+    if pd.isna(device_info):
+        return None   # NaN → LightGBM handles natively; is_unknown_os=1 flags this
+    d = str(device_info).lower()
+    if "windows" in d:
+        return "windows"
+    if "ios" in d or "iphone" in d or "ipad" in d:
+        return "ios"
+    if "mac" in d:
+        return "macos"
+    if "android" in d or "samsung" in d or "sm-" in d:
+        return "android"
+    if "linux" in d:
+        return "linux"
+    return "other"
+
+
+def compute_identity_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Engineer risk signals from identity and device columns.
+
+    Identity records are only available for ~24% of transactions — column
+    guards ensure this function is safe to call when any field is absent
+    (e.g. at API inference time when identity columns are not supplied).
+
+    Adds:
+        is_unknown_os : 1 when DeviceInfo is absent — explicit flag for
+                        transactions with no device fingerprint. Replaces
+                        the old 'has_identity' and 'id_null_count' features
+                        which were both near-constant (76% rows had no identity
+                        record) and redundant with each other.
+        is_mobile     : 1 if DeviceType is 'mobile'.
+        device_os     : coarse OS category from DeviceInfo
+                        (windows / ios / macos / android / linux / other).
+                        NaN when DeviceInfo is absent — LightGBM handles NaN
+                        natively, avoiding the dominant 'unknown' sentinel that
+                        previously distorted tree splits.
+
+    Args:
+        df: DataFrame that may contain DeviceType and DeviceInfo.
+
+    Returns:
+        DataFrame with is_unknown_os, is_mobile, and device_os added.
+    """
+    df = df.copy()
+
+    # 1. is_unknown_os — explicit flag for missing device fingerprint.
+    # Replaces has_identity (correlated inverse) and id_null_count (near-constant).
+    if "DeviceInfo" in df.columns:
+        df["is_unknown_os"] = df["DeviceInfo"].isna().astype(int)
+    else:
+        df["is_unknown_os"] = 1  # no device info column at all
+
+    # 2. is_mobile — mobile and desktop fraud patterns differ meaningfully
+    if "DeviceType" in df.columns:
+        df["is_mobile"] = (df["DeviceType"].str.lower() == "mobile").astype(int)
+    else:
+        df["is_mobile"] = 0
+
+    # 3. device_os — NaN for missing DeviceInfo (not "unknown") so LightGBM
+    # treats absence as missing rather than a dominant categorical value.
+    if "DeviceInfo" in df.columns:
+        df["device_os"] = pd.Categorical(df["DeviceInfo"].apply(_extract_os))
+    else:
+        df["device_os"] = pd.Categorical([None] * len(df))
 
     return df
 
@@ -317,14 +421,16 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
 
     Steps:
       1. Merge identity features onto transactions (left join, optional)
-      2. Add user proxy (card_addr)
-      3. Velocity across 1h / 24h / 7d windows
-      4. Amount deviation from historical mean
-      5. Time features (hour of day, day of week)
-      6. Card-level unique address and amount counts
-      7. Email domain features (match flag, free-provider flag)
-      8. Amount structure features (cents portion, round-number flag)
-      9. D1 features (log-transform, null flag)
+      2. Drop confirmed zero-importance id columns (_WEAK_ID_COLS)
+      3. Add user proxy (card_addr)
+      4. Velocity across 1h / 24h / 7d windows
+      5. Amount deviation from historical mean
+      6. Time features (hour of day, day of week, month of year)
+      7. Card-level unique address and amount counts
+      8. Email domain features (match flag, free-provider flag)
+      9. Amount structure features (cents portion, round-number flag)
+     10. D1–D9 features (log-transform, null flag)
+     11. Identity features (is_unknown_os, is_mobile, device_os)
 
     Args:
         trn: Raw transaction DataFrame.
@@ -334,6 +440,14 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
         DataFrame with all engineered features added.
     """
     df = merge_identity(trn, idn) if idn is not None else trn.copy()
+
+    # Drop id columns with confirmed zero importance — reduces noise before
+    # SelectFromModel runs without relying on the model to filter them out.
+    weak_cols = [c for c in _WEAK_ID_COLS if c in df.columns]
+    if weak_cols:
+        df = df.drop(columns=weak_cols)
+        print(f"Dropped {len(weak_cols)} weak id columns")
+
     df = add_user_proxy(df)
     df = compute_velocity_multi_window(df)
     df = compute_amount_deviation(df)
@@ -342,4 +456,5 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
     df = compute_email_features(df)
     df = compute_amount_features(df)
     df = compute_d_features(df)
+    df = compute_identity_features(df)
     return df

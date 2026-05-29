@@ -18,5 +18,15 @@ build/
 # MLflow
 mlruns/
 
+# Model artifacts (regenerable from notebook)
+models/*.pkl
+models/*.json
+
+# CatBoost training logs
+notebooks/catboost_info/
+
+# Local Claude settings
+.claude/
+
 # OS
 .DS_Store
