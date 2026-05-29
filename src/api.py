@@ -31,7 +31,8 @@ from src.features import (
 )
 
 # String columns that must stay as object — everything else is numeric
-_STRING_COLS = {"ProductCD", "card4", "card6", "P_emaildomain", "R_emaildomain"}
+_STRING_COLS = {"ProductCD", "card4", "card6", "P_emaildomain", "R_emaildomain",
+               "DeviceType", "DeviceInfo"}
 
 
 def _coerce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
