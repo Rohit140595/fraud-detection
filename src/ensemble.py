@@ -42,7 +42,7 @@ RANDOM_STATE = 42
 def encode_for_ensemble(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], dict]:
     """
     Ordinal-encode category columns to integers for cross-framework compatibility.
 
@@ -55,11 +55,14 @@ def encode_for_ensemble(
         X_test:  Test features with 'category' dtype columns.
 
     Returns:
-        (X_train_enc, X_test_enc, cat_cols)
+        (X_train_enc, X_test_enc, cat_cols, cat_encoders)
+        cat_encoders: {col: {label: int_code}} — saved alongside the model so the
+        serving layer can apply the exact same mapping at inference time.
     """
     X_train = X_train.copy()
     X_test  = X_test.copy()
     cat_cols = X_train.select_dtypes(include="category").columns.tolist()
+    cat_encoders: dict[str, dict] = {}
 
     for col in cat_cols:
         # Build label→code mapping from X_train's category set
@@ -67,10 +70,11 @@ def encode_for_ensemble(
             cat: code
             for code, cat in enumerate(X_train[col].cat.categories)
         }
+        cat_encoders[col] = cat_to_code
         X_train[col] = X_train[col].cat.codes                              # NaN → -1
         X_test[col]  = X_test[col].astype(object).map(cat_to_code).fillna(-1).astype(int)
 
-    return X_train, X_test, cat_cols
+    return X_train, X_test, cat_cols, cat_encoders
 
 
 # ── Shared CV helper ───────────────────────────────────────────────────────────
@@ -345,20 +349,22 @@ def evaluate_ensemble(
 def save_ensemble(
     models: dict,
     cat_cols: list[str],
+    cat_encoders: dict,
     path: Path = ENSEMBLE_PATH,
 ) -> None:
-    """Persist the ensemble and cat_cols to disk."""
+    """Persist the ensemble, cat_cols, and cat_encoders to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"models": models, "cat_cols": cat_cols}, path)
+    joblib.dump({"models": models, "cat_cols": cat_cols, "cat_encoders": cat_encoders}, path)
     print(f"Ensemble saved to {path}  ({len(models)} models)")
 
 
-def load_ensemble(path: Path = ENSEMBLE_PATH) -> tuple[dict, list[str]]:
+def load_ensemble(path: Path = ENSEMBLE_PATH) -> tuple[dict, list[str], dict]:
     """
     Load a persisted ensemble from disk.
 
     Returns:
-        (models, cat_cols)
+        (models, cat_cols, cat_encoders)
+        cat_encoders: {col: {label: int_code}} for consistent inference-time encoding.
     """
     data = joblib.load(path)
-    return data["models"], data["cat_cols"]
+    return data["models"], data["cat_cols"], data.get("cat_encoders", {})

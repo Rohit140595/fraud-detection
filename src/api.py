@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
     read from disk once per server process, and the app fails fast on startup if
     the model file is missing — rather than failing silently on the first request.
     """
-    app.state.models, app.state.cat_cols = load_ensemble()
+    app.state.models, app.state.cat_cols, app.state.cat_encoders = load_ensemble()
     yield
 
 
@@ -172,10 +172,13 @@ def predict(request: TransactionRequest):
     df = compute_d_features(df)
     df = compute_identity_features(df)
 
-    # 5. Ordinal-encode categoricals — must match the codes used during training.
+    # 5. Ordinal-encode categoricals using the exact same label→code mapping that
+    #    was fit on X_train during training. Unknown/missing values → -1 (same
+    #    sentinel used by encode_for_ensemble for unseen categories).
     for col in app.state.cat_cols:
         if col in df.columns:
-            df[col] = df[col].astype("category").cat.codes
+            encoder = app.state.cat_encoders.get(col, {})
+            df[col] = df[col].map(encoder).fillna(-1).astype(int)
 
     # 6 & 7. Score: average predict_proba across all ensemble models (soft vote).
     lgbm_m = app.state.models["lgbm"]
@@ -185,6 +188,12 @@ def predict(request: TransactionRequest):
     lgbm_df = df.reindex(columns=lgbm_m.feature_names_in_)
     xgb_df  = df.reindex(columns=xgb_m.feature_names_in_)
     cat_df  = df.reindex(columns=cat_m.feature_names_)
+
+    # CatBoost rejects float NaN for declared cat_features — reindex fills missing
+    # columns with NaN, so explicitly replace with -1 (unseen-category sentinel).
+    for col in app.state.cat_cols:
+        if col in cat_df.columns:
+            cat_df[col] = cat_df[col].fillna(-1).astype(int)
 
     prob = (
         lgbm_m.predict_proba(lgbm_df)[0, 1]
