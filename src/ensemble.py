@@ -306,6 +306,27 @@ def predict_proba_ensemble(models: dict, X: pd.DataFrame) -> np.ndarray:
     return np.mean(probs, axis=0)
 
 
+def apply_calibrator(calibrator, raw_probs: np.ndarray) -> np.ndarray:
+    """
+    Apply a fitted calibrator to a 1-D array of raw ensemble probabilities.
+
+    Handles both calibrator types transparently:
+      - IsotonicRegression: expects 1-D input, returns 1-D output via predict()
+      - LogisticRegression (Platt): expects 2-D input, returns probabilities
+        via predict_proba()[:, 1]
+
+    Args:
+        calibrator: Fitted IsotonicRegression or LogisticRegression.
+        raw_probs:  1-D array of raw ensemble scores.
+
+    Returns:
+        1-D array of calibrated probabilities.
+    """
+    if isinstance(calibrator, LogisticRegression):
+        return calibrator.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
+    return calibrator.predict(raw_probs)
+
+
 def evaluate_ensemble(
     models: dict,
     X_test: pd.DataFrame,
@@ -390,10 +411,7 @@ def calibrate_ensemble(
         calibrator.fit(raw_probs.reshape(-1, 1), y_cal)
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
-    cal_probs = (
-        calibrator.predict(raw_probs) if method == "isotonic"
-        else calibrator.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
-    )
+    cal_probs = apply_calibrator(calibrator, raw_probs)
     brier_before = brier_score_loss(y_cal, raw_probs)
     brier_after  = brier_score_loss(y_cal, cal_probs)
     print(f"Brier score  before calibration : {brier_before:.4f}")
