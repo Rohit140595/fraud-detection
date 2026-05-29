@@ -1,29 +1,27 @@
 """
-Model training and evaluation for real-time fraud detection.
+Data preparation and feature selection for real-time fraud detection.
 
 Design decisions:
   - Time-based train/test split to avoid temporal data leakage.
-  - LightGBM with scale_pos_weight to handle class imbalance.
-  - PR-AUC as primary metric — more informative than ROC-AUC on imbalanced data.
-  - Model persisted to disk so it can be loaded by the FastAPI serving layer.
+  - SHAP-based feature selection — uses actual prediction contribution
+    (not split counts) to rank features. Results cached to disk so SHAP
+    only runs once regardless of how many times the notebook is re-executed.
 """
 
-import joblib
+import json
 from pathlib import Path
 
 import numpy as np
-import optuna
 import lightgbm as lgb
-import matplotlib.pyplot as plt
 import pandas as pd
-from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
-from sklearn.model_selection import TimeSeriesSplit
+import shap
 
 
 LABEL = "isFraud"
 DROP_COLS = ["TransactionID", "card_addr"]
 MISSING_THRESHOLD = 0.99
-MODEL_PATH = Path(__file__).parent.parent / "models" / "lgbm_fraud.pkl"
+RANDOM_STATE = 42
+SHAP_CACHE_PATH = Path(__file__).parent.parent / "models" / "shap_features.json"
 
 
 def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -31,9 +29,12 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     Clean and prepare the feature matrix for modeling.
 
     Steps:
-      1. Drop columns with >99% missing values — pure noise at that rate.
-      2. Drop helper columns not needed for modeling.
-      3. Cast object columns to 'category' so LightGBM handles them natively
+      1. Drop columns with >99% missing values — heavily sparse columns add
+         noise and inflate the feature space without contributing stable signal.
+      2. Drop constant columns (only 1 unique value) — zero variance means
+         no discriminative power; keeping them wastes splits in the trees.
+      3. Drop helper columns not needed for modeling.
+      4. Cast object columns to 'category' so LightGBM handles them natively
          (no manual label encoding needed).
 
     Args:
@@ -42,18 +43,19 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         Cleaned DataFrame ready for train/test split.
     """
-    # Drop high-missingness columns
     missing_rate = df.isnull().mean()
     cols_to_drop = missing_rate[missing_rate > MISSING_THRESHOLD].index.tolist()
     print(f"Dropping {len(cols_to_drop)} columns with >{MISSING_THRESHOLD:.0%} missing")
     df = df.drop(columns=cols_to_drop)
 
-    # Drop non-feature columns
+    constant_cols = [c for c in df.columns if df[c].nunique(dropna=True) <= 1]
+    print(f"Dropping {len(constant_cols)} constant columns")
+    df = df.drop(columns=constant_cols)
+
     df = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
 
     # Encode categoricals — LightGBM handles 'category' dtype natively
-    cat_cols = df.select_dtypes(include="object").columns.tolist()
-    for col in cat_cols:
+    for col in df.select_dtypes(include="object").columns:
         df[col] = df[col].astype("category")
 
     return df
@@ -81,292 +83,102 @@ def time_based_split(
     return df.iloc[:split_idx], df.iloc[split_idx:]
 
 
-def select_features(
+def select_features_shap(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
-    threshold: str = "mean",
+    top_n: int = 40,
+    sample_size: int = 50_000,
+    cache_path: Path = SHAP_CACHE_PATH,
+    force_recompute: bool = False,
 ) -> tuple:
     """
-    Train a fast baseline LightGBM internally, then select features
-    whose importance meets the threshold using SelectFromModel.
+    Select the top N features by mean absolute SHAP value.
 
-    Using 'mean' or 'median' is more principled than keeping any feature
-    with non-zero importance — it retains only features that contribute
-    meaningfully relative to the average, reducing overfitting noise.
+    SHAP measures each feature's actual contribution to predictions — more
+    accurate than split-count importance (used by SelectFromModel), which is
+    biased toward high-cardinality features and misrepresents low-frequency
+    but highly predictive features.
+
+    Results are cached to disk so SHAP only runs once. On subsequent calls
+    the cached feature list is loaded directly unless force_recompute=True
+    or the cache is stale (contains features no longer in X_train).
+
+    A 50K subsample is used for SHAP computation — sufficient for stable
+    feature ranking while keeping runtime to ~1–2 min.
 
     Args:
-        X_train:   Training feature matrix.
-        y_train:   Training labels.
-        X_test:    Test feature matrix.
-        threshold: Importance cutoff — 'mean', 'median', or a float.
-                   'mean' keeps features above average importance (recommended).
-                   'median' is more aggressive, keeping the top 50%.
+        X_train:         Training feature matrix.
+        y_train:         Training labels.
+        X_test:          Test feature matrix.
+        top_n:           Number of top features to keep (default 40).
+        sample_size:     Rows used for SHAP computation (default 50,000).
+        cache_path:      Path to the JSON cache file.
+        force_recompute: Ignore existing cache and rerun SHAP (default False).
 
     Returns:
         (X_train_filtered, X_test_filtered, selected_feature_names)
     """
-    from sklearn.feature_selection import SelectFromModel
+    # ── Load from cache if available ──────────────────────────────────────────
+    if not force_recompute and cache_path.exists():
+        with open(cache_path) as f:
+            cached = json.load(f)
+        selected = cached.get("features", [])
+        missing = [feat for feat in selected if feat not in X_train.columns]
+        if not missing:
+            print(f"SHAP cache loaded : {len(selected)} features  ({cache_path.name})")
+            return X_train[selected], X_test[selected], selected
+        print(f"Cache stale — {len(missing)} features missing, recomputing ...")
 
+    # ── Compute SHAP ──────────────────────────────────────────────────────────
     neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
 
-    # Fast baseline — just enough trees to estimate stable feature importances
+    # Subsample for speed — 50K rows is sufficient for stable feature ranking
+    if len(X_train) > sample_size:
+        rng = np.random.RandomState(RANDOM_STATE)
+        idx = rng.choice(len(X_train), sample_size, replace=False)
+        X_sample = X_train.iloc[idx]
+        y_sample = y_train.iloc[idx]
+    else:
+        X_sample, y_sample = X_train, y_train
+
+    print(f"Computing SHAP on {len(X_sample):,} rows × {X_train.shape[1]} features ...")
+
+    # Baseline LightGBM — fast defaults, just enough to rank features reliably
     baseline = lgb.LGBMClassifier(
         n_estimators=200,
         learning_rate=0.05,
         num_leaves=64,
         scale_pos_weight=neg / pos,
-        random_state=42,
+        random_state=RANDOM_STATE,
         n_jobs=-1,
         verbose=-1,
     )
+    baseline.fit(X_sample, y_sample)
 
-    # SelectFromModel fits the baseline and applies the importance threshold
-    selector = SelectFromModel(baseline, threshold=threshold)
-    selector.fit(X_train, y_train)
+    # TreeExplainer is fast for tree models — uses the tree structure directly
+    explainer = shap.TreeExplainer(baseline)
+    shap_values = explainer.shap_values(X_sample)
 
-    # Boolean mask → column names from original DataFrame
-    support = selector.get_support()
-    selected_features = X_train.columns[support].tolist()
+    # LightGBM binary classification returns a list [neg_class, pos_class];
+    # index [1] is the positive (fraud) class contribution
+    if isinstance(shap_values, list):
+        shap_values = shap_values[1]
 
-    print(f"Features kept   : {len(selected_features)} / {X_train.shape[1]}")
-    print(f"Features dropped: {X_train.shape[1] - len(selected_features)}")
+    # Rank by mean |SHAP| — average absolute contribution per feature
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    top_idx = np.argsort(mean_abs_shap)[::-1][:top_n]
+    selected = X_train.columns[top_idx].tolist()
 
-    return X_train[selected_features], X_test[selected_features], selected_features
+    print(f"SHAP selection : top {len(selected)} / {X_train.shape[1]} features")
+    print("Top 10 by mean |SHAP|:")
+    for name, score in zip(selected[:10], mean_abs_shap[top_idx[:10]]):
+        print(f"  {name:<35} {score:.4f}")
 
+    # ── Save to cache ─────────────────────────────────────────────────────────
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump({"features": selected, "top_n": top_n}, f, indent=2)
+    print(f"SHAP features cached to {cache_path.name}")
 
-def tune_hyperparameters(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    n_trials: int = 50,
-) -> dict:
-    """
-    Search for the best LightGBM hyperparameters using Optuna.
-
-    Uses TimeSeriesSplit(n_splits=3) so each fold respects temporal order —
-    validation data is always later than training data, matching production.
-    PR-AUC is the optimisation target because it is more informative than
-    ROC-AUC on the heavily imbalanced fraud dataset.
-
-    Args:
-        X_train:  Training features.
-        y_train:  Training labels.
-        n_trials: Number of Optuna trials (default 50).
-
-    Returns:
-        Dictionary of best hyperparameters, ready to pass to LGBMClassifier.
-    """
-    # Compute once here — reused in every trial without recalculating
-    neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
-    scale_pos_weight = neg / pos
-
-    def objective(trial):
-        # Optuna samples one combination of params per trial.
-        # log=True for learning_rate so the search is uniform on a log scale
-        # (treats 0.01→0.1 the same as 0.1→1.0, which is correct for rates).
-        params = {
-            "num_leaves":        trial.suggest_int("num_leaves", 20, 300),
-            "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "max_depth":         trial.suggest_int("max_depth", 3, 12),
-            "min_child_samples": trial.suggest_int("min_child_samples", 20, 200),
-            "feature_fraction":  trial.suggest_float("feature_fraction", 0.5, 1.0),
-            "bagging_fraction":  trial.suggest_float("bagging_fraction", 0.5, 1.0),
-            "lambda_l1":         trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
-            "lambda_l2":         trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
-            "scale_pos_weight":  scale_pos_weight,
-            "bagging_freq":      1,     # required for bagging_fraction to take effect
-            "n_estimators":      300,   # fixed — early stopping handled in final train()
-            "random_state":      42,
-            "n_jobs":            -1,
-            "verbose":           -1,    # suppress per-fold LightGBM output
-        }
-
-        # TimeSeriesSplit ensures each fold's validation is strictly later than
-        # its training data — prevents leakage from future transactions into
-        # behavioural features (velocity, historical mean).
-        tscv = TimeSeriesSplit(n_splits=3)
-        pr_aucs = []
-
-        for train_idx, val_idx in tscv.split(X_train):
-            X_fold_tr, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-            y_fold_tr, y_fold_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
-
-            model = lgb.LGBMClassifier(**params)
-            model.fit(X_fold_tr, y_fold_tr)
-
-            # [:, 1] gives the probability of the positive (fraud) class
-            y_prob = model.predict_proba(X_fold_val)[:, 1]
-            precision, recall, _ = precision_recall_curve(y_fold_val, y_prob)
-            pr_aucs.append(auc(recall, precision))
-
-        # Optuna maximises this return value across all trials
-        return np.mean(pr_aucs)
-
-    # Suppress Optuna's per-trial INFO logs — progress bar is enough
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    # TPESampler with fixed seed ensures the same trials are sampled every run
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-    )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-
-    print(f"Best PR-AUC : {study.best_value:.4f}")
-    print(f"Best params : {study.best_params}")
-
-    return study.best_params
-
-
-def train(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
-) -> lgb.LGBMClassifier:
-    """
-    Train a LightGBM classifier with early stopping.
-
-    scale_pos_weight = (# negatives) / (# positives) tells LightGBM to penalise
-    missed fraud proportionally to its rarity — a simple, effective imbalance fix
-    that avoids the complexity of SMOTE on mixed/missing data.
-
-    Args:
-        X_train, y_train: Training features and labels.
-        X_val, y_val:     Validation features and labels for early stopping.
-
-    Returns:
-        Trained LGBMClassifier.
-    """
-    neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
-    scale_pos_weight = neg / pos
-    print(f"scale_pos_weight: {scale_pos_weight:.1f}  (neg={neg:,}, pos={pos:,})")
-
-    model = lgb.LGBMClassifier(
-        n_estimators=500,
-        learning_rate=0.05,
-        num_leaves=64,
-        scale_pos_weight=scale_pos_weight,
-        random_state=42,
-        n_jobs=-1,
-    )
-
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        callbacks=[
-            lgb.early_stopping(50, verbose=False),
-            lgb.log_evaluation(50),  # matches early-stopping patience — always fires at least once
-        ],
-    )
-    print(f"Best iteration : {model.best_iteration_}")
-
-    return model
-
-
-def evaluate(
-    model: lgb.LGBMClassifier,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    plot: bool = True,
-) -> dict:
-    """
-    Evaluate model using PR-AUC and ROC-AUC.
-
-    PR-AUC is the primary metric for imbalanced fraud detection — it focuses
-    on the minority class and is not inflated by the large number of true negatives.
-
-    Args:
-        model:  Trained LGBMClassifier.
-        X_test: Test features.
-        y_test: True labels.
-        plot:   Whether to display the precision-recall curve.
-
-    Returns:
-        Dictionary with pr_auc and roc_auc scores.
-    """
-    y_prob = model.predict_proba(X_test)[:, 1]
-
-    precision, recall, _ = precision_recall_curve(y_test, y_prob)
-    pr_auc = auc(recall, precision)
-    roc_auc = roc_auc_score(y_test, y_prob)
-
-    print(f"PR-AUC  : {pr_auc:.4f}")
-    print(f"ROC-AUC : {roc_auc:.4f}")
-
-    if plot:
-        baseline = y_test.mean()
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(recall, precision, color="steelblue", lw=2, label=f"PR-AUC = {pr_auc:.4f}")
-        ax.axhline(baseline, color="tomato", linestyle="--", label=f"Random baseline ({baseline:.2%})")
-        ax.set_xlabel("Recall")
-        ax.set_ylabel("Precision")
-        ax.set_title("Precision-Recall Curve")
-        ax.legend()
-        plt.tight_layout()
-        plt.show()
-
-    return {"pr_auc": pr_auc, "roc_auc": roc_auc}
-
-
-def plot_feature_importance(
-    model: lgb.LGBMClassifier,
-    feature_names: list[str],
-    top_n: int = 20,
-) -> None:
-    """
-    Plot the top N most important features.
-
-    Useful for checking whether engineered features (velocity_1h, amt_deviation)
-    added meaningful signal on top of the raw columns.
-
-    Args:
-        model:         Trained LGBMClassifier.
-        feature_names: List of feature names used during training.
-        top_n:         Number of top features to display.
-    """
-    importance = (
-        pd.DataFrame({"feature": feature_names, "importance": model.feature_importances_})
-        .sort_values("importance", ascending=False)
-        .head(top_n)
-    )
-
-    print(importance.to_string(index=False))
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    importance.plot(x="feature", y="importance", kind="barh", ax=ax, color="steelblue", legend=False)
-    ax.invert_yaxis()
-    ax.set_title(f"Top {top_n} Feature Importances")
-    plt.tight_layout()
-    plt.show()
-
-
-def save_model(
-    model: lgb.LGBMClassifier,
-    cat_features: list[str],
-    path: Path = MODEL_PATH,
-) -> None:
-    """
-    Persist the trained model and categorical feature names to disk.
-
-    Saving cat_features alongside the model ensures the serving layer
-    can cast the right columns to 'category' dtype at inference time,
-    matching exactly what LightGBM saw during training.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": model, "cat_features": cat_features}, path)
-    print(f"Model saved to {path}  ({len(cat_features)} categorical features)")
-
-
-def load_model(path: Path = MODEL_PATH) -> tuple[lgb.LGBMClassifier, list[str]]:
-    """
-    Load a persisted model and its categorical feature names from disk.
-
-    Returns:
-        (model, cat_features) — both needed for correct inference.
-    """
-    data = joblib.load(path)
-    if isinstance(data, dict):
-        return data["model"], data["cat_features"]
-    # backward compatibility — old saves without cat_features
-    return data, []
+    return X_train[selected], X_test[selected], selected
