@@ -88,9 +88,11 @@ class TransactionRequest(BaseModel):
     # Core fields — required
     TransactionAmt: float
     card1:          int
-    addr1:          float
     TransactionDT:  int
     ProductCD:      str
+
+    # addr1 is the billing zip code — present for most transactions but not all
+    addr1: Optional[float] = None
 
     # Optional raw fields the model uses directly
     card4:          Optional[str]   = None

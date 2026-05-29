@@ -74,27 +74,38 @@ def send_request(url: str, payload: dict) -> dict:
     POST a transaction payload to the /predict endpoint and return the result with latency.
 
     Latency is measured as wall-clock round-trip time including network + server processing.
-    On non-200 responses, returns a dict with None scores so run_simulation can still
-    record the row (with true_label) without crashing — failed rows are visible in the
-    results DataFrame and excluded from metric computations via NaN handling.
+    On non-200 responses or unparseable bodies, returns a dict with None scores so
+    run_simulation can still record the row (with true_label) without crashing —
+    failed rows are visible in the results DataFrame and excluded from metric
+    computations via NaN handling.
 
     Args:
         url:     Full URL of the /predict endpoint (e.g. 'http://localhost:8000/predict').
         payload: JSON-serialisable dict produced by row_to_payload.
 
     Returns:
-        Dict with fraud_probability, is_fraud, threshold, and latency_ms.
-        On failure, fraud_probability/is_fraud/threshold are None.
+        Dict with fraud_probability, is_fraud, threshold, latency_ms, and
+        optionally error/status_code on failure.
     """
-    start = time.perf_counter()
-    response = requests.post(url, json=payload)
-    elapsed_ms = (time.perf_counter() - start) * 1000
+    _null = {"fraud_probability": None, "is_fraud": None, "threshold": None}
+
+    try:
+        start = time.perf_counter()
+        response = requests.post(url, json=payload, timeout=10)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+    except requests.exceptions.RequestException as exc:
+        return {**_null, "latency_ms": None, "error": str(exc)}
 
     if response.status_code != 200:
-        return {"fraud_probability": None, "is_fraud": None,
-                "threshold": None, "latency_ms": elapsed_ms}
+        return {**_null, "latency_ms": elapsed_ms,
+                "status_code": response.status_code, "error": response.text[:200]}
 
-    result = response.json()
+    try:
+        result = response.json()
+    except ValueError:
+        return {**_null, "latency_ms": elapsed_ms,
+                "error": f"non-JSON body (len={len(response.content)})"}
+
     result["latency_ms"] = elapsed_ms
     return result
         
