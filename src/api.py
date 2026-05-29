@@ -178,7 +178,9 @@ def predict(request: TransactionRequest):
             df[col] = df[col].astype("category").cat.codes
 
     # 6 & 7. Score: average predict_proba across all ensemble models (soft vote).
-    lgbm_m, xgb_m, cat_m = app.state.models
+    lgbm_m = app.state.models["lgbm"]
+    xgb_m  = app.state.models["xgb"]
+    cat_m  = app.state.models["catboost"]
 
     lgbm_df = df.reindex(columns=lgbm_m.feature_names_in_)
     xgb_df  = df.reindex(columns=xgb_m.feature_names_in_)
