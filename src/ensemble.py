@@ -375,7 +375,8 @@ def calibrate_ensemble(
                  a logistic relationship between raw score and true probability.
 
     Returns:
-        Fitted calibrator (IsotonicRegression or LogisticRegression).
+        (calibrator, cal_metrics) where cal_metrics contains brier_before and
+        brier_after so the caller can log them without recomputing.
     """
     raw_probs = predict_proba_ensemble(models, X_cal)
 
@@ -412,7 +413,8 @@ def calibrate_ensemble(
     plt.tight_layout()
     plt.show()
 
-    return calibrator
+    cal_metrics = {"brier_before": brier_before, "brier_after": brier_after}
+    return calibrator, cal_metrics
 
 
 def tune_threshold(
