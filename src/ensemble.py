@@ -121,6 +121,7 @@ def _tune_lgbm(X_train, y_train, n_trials: int, scale_pos_weight: float) -> dict
     return study.best_params
 
 
+
 def _tune_xgb(X_train, y_train, n_trials: int, scale_pos_weight: float) -> dict:
     def objective(trial):
         params = {
@@ -136,7 +137,7 @@ def _tune_xgb(X_train, y_train, n_trials: int, scale_pos_weight: float) -> dict:
         return _pr_auc_cv(xgb.XGBClassifier, params, X_train, y_train)
 
     study = optuna.create_study(direction="maximize",
-                                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+                                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE + 1))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     print(f"  XGBoost  best PR-AUC : {study.best_value:.4f}  {study.best_params}")
     return study.best_params
@@ -161,7 +162,7 @@ def _tune_catboost(
         return _pr_auc_cv(CatBoostClassifier, params, X_train, y_train)
 
     study = optuna.create_study(direction="maximize",
-                                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+                                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE + 2))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     print(f"  CatBoost best PR-AUC : {study.best_value:.4f}  {study.best_params}")
     return study.best_params
