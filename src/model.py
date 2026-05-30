@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 """
 Data preparation and feature selection for real-time fraud detection.
 
 Design decisions:
-  - Time-based train/test split to avoid temporal data leakage.
+  - Three-way chronological split (train / cal / test) to keep calibration
+    data fully independent of model training and early stopping.
   - SHAP-based feature selection — uses actual prediction contribution
     (not split counts) to rank features. Results cached to disk so SHAP
     only runs once regardless of how many times the notebook is re-executed.
@@ -61,32 +64,45 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def time_based_split(
-    df: pd.DataFrame, train_frac: float = 0.8
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def three_way_split(
+    df: pd.DataFrame,
+    train_frac: float = 0.70,
+    cal_frac:   float = 0.10,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Split data chronologically — train on earlier, test on later transactions.
+    Split data chronologically into train / calibration / test sets.
 
-    A random split would leak future transaction history into training features
-    (velocity, historical mean) that wouldn't be available at prediction time
-    in production. Time-based split prevents this.
+    All three cuts are strictly ordered by TransactionDT so no future
+    information leaks into earlier splits.
+
+    Split roles:
+      train — model training and Optuna hyperparameter tuning
+              (TimeSeriesSplit CV stays entirely within this slice)
+      cal   — calibration only; never seen during training or early stopping,
+              ensuring the calibrator is fit on genuinely unseen scores
+      test  — early stopping for the final ensemble fit + held-out evaluation
 
     Args:
         df:          Prepared feature DataFrame (must contain 'TransactionDT').
-        train_frac:  Fraction of data to use for training (default 0.8).
+        train_frac:  Fraction of rows for training (default 0.70).
+        cal_frac:    Fraction of rows for calibration (default 0.10).
+                     Remainder (1 - train_frac - cal_frac) goes to test.
 
     Returns:
-        (train, test) DataFrames.
+        (train, cal, test) DataFrames.
     """
     df = df.sort_values("TransactionDT").reset_index(drop=True)
-    split_idx = int(len(df) * train_frac)
-    return df.iloc[:split_idx], df.iloc[split_idx:]
+    n = len(df)
+    train_end = int(n * train_frac)
+    cal_end   = int(n * (train_frac + cal_frac))
+    return df.iloc[:train_end], df.iloc[train_end:cal_end], df.iloc[cal_end:]
 
 
 def select_features_shap(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
+    X_cal: pd.DataFrame | None = None,
     top_n: int = 40,
     sample_size: int = 50_000,
     cache_path: Path = SHAP_CACHE_PATH,
@@ -111,13 +127,16 @@ def select_features_shap(
         X_train:         Training feature matrix.
         y_train:         Training labels.
         X_test:          Test feature matrix.
+        X_cal:           Optional calibration feature matrix — filtered alongside
+                         train/test when provided.
         top_n:           Number of top features to keep (default 40).
         sample_size:     Rows used for SHAP computation (default 50,000).
         cache_path:      Path to the JSON cache file.
         force_recompute: Ignore existing cache and rerun SHAP (default False).
 
     Returns:
-        (X_train_filtered, X_test_filtered, selected_feature_names)
+        (X_train_f, X_test_f, selected_features) when X_cal is None.
+        (X_train_f, X_test_f, X_cal_f, selected_features) when X_cal is provided.
     """
     # ── Load from cache if available ──────────────────────────────────────────
     if not force_recompute and cache_path.exists():
@@ -127,6 +146,8 @@ def select_features_shap(
         missing = [feat for feat in selected if feat not in X_train.columns]
         if not missing:
             print(f"SHAP cache loaded : {len(selected)} features  ({cache_path.name})")
+            if X_cal is not None:
+                return X_train[selected], X_test[selected], X_cal[selected], selected
             return X_train[selected], X_test[selected], selected
         print(f"Cache stale — {len(missing)} features missing, recomputing ...")
 
@@ -181,4 +202,6 @@ def select_features_shap(
         json.dump({"features": selected, "top_n": top_n}, f, indent=2)
     print(f"SHAP features cached to {cache_path.name}")
 
+    if X_cal is not None:
+        return X_train[selected], X_test[selected], X_cal[selected], selected
     return X_train[selected], X_test[selected], selected

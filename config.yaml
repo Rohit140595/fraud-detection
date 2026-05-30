@@ -1,9 +1,13 @@
 random_state: 42
 
 paths:
-  lgbm_model: models/lgbm_fraud.pkl
   ensemble:   models/ensemble_fraud.pkl
   shap_cache: models/shap_features.json
+
+split:
+  train_frac: 0.70
+  cal_frac:   0.10
+  # test_frac: 0.20 (remainder)
 
 feature_selection:
   top_n: 40
@@ -14,5 +18,8 @@ tuning:
   n_cv_splits: 5
 
 ensemble:
-  use_ensemble: true
   threshold: 0.5
+
+calibration:
+  method: sigmoid   # isotonic | sigmoid
+  beta:   2          # F-beta for threshold tuning (beta=2 weights recall 4x over precision)
