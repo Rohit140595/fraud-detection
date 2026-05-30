@@ -21,5 +21,5 @@ ensemble:
   threshold: 0.5
 
 calibration:
-  method: isotonic   # isotonic | sigmoid
+  method: sigmoid   # isotonic | sigmoid
   beta:   2          # F-beta for threshold tuning (beta=2 weights recall 4x over precision)
