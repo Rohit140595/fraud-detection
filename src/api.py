@@ -19,11 +19,12 @@ Design decisions:
 
 from contextlib import asynccontextmanager
 from typing import Optional
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict
 
-from src.ensemble import load_ensemble
+from src.ensemble import load_ensemble, apply_calibrator
 from src.features import (
     add_user_proxy, compute_time_features,
     compute_email_features, compute_amount_features,
@@ -207,7 +208,7 @@ def predict(request: TransactionRequest):
 
     # 8. Apply calibration if a calibrator was saved with the model.
     if app.state.calibrator is not None:
-        fraud_probability = float(app.state.calibrator.predict([raw_prob])[0])
+        fraud_probability = float(apply_calibrator(app.state.calibrator, np.array([raw_prob]))[0])
     else:
         fraud_probability = float(raw_prob)
 
