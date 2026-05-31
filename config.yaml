@@ -14,8 +14,10 @@ feature_selection:
   sample_size: 50000
 
 tuning:
-  n_trials: 50
-  n_cv_splits: 5
+  n_trials:       50
+  n_trials_quick: 3       # fast sanity-check run (~5 min)
+  quick_test:     false    # true = use n_trials_quick + 5K SHAP sample; false = full run
+  n_cv_splits:    5
 
 ensemble:
   threshold: 0.5

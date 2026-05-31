@@ -131,6 +131,7 @@ def _tune_xgb(X_train, y_train, n_trials: int, scale_pos_weight: float) -> dict:
             "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
             "scale_pos_weight": scale_pos_weight,
+            "tree_method":      "hist",         # histogram splits — much faster than 'exact'
             "random_state": RANDOM_STATE, "n_jobs": -1, "verbosity": 0,
             # No early_stopping_rounds — fit() has no eval_set during CV
         }
@@ -153,9 +154,12 @@ def _tune_catboost(
             "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
             "subsample":         trial.suggest_float("subsample", 0.5, 1.0),
             "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.5, 1.0),
+            "boosting_type":     "Plain",       # faster than default 'Ordered' on CPU
             "bootstrap_type":    "Bernoulli",   # required for subsample to take effect
             "class_weights":     [1.0, scale_pos_weight],
             "cat_features":      cat_cols,
+            "border_count":      32,            # default 254 — fewer splits, much faster
+            "thread_count":      -1,            # use all CPU cores
             "random_seed": RANDOM_STATE, "verbose": 0,
             # No early_stopping_rounds — fit() has no eval_set during CV
         }
