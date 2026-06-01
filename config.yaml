@@ -5,8 +5,7 @@ paths:
   shap_cache: models/shap_features.json
 
 split:
-  train_frac: 0.70
-  cal_frac:   0.10
+  train_frac: 0.80
   # test_frac: 0.20 (remainder)
 
 feature_selection:
@@ -22,6 +21,5 @@ tuning:
 ensemble:
   threshold: 0.5
 
-calibration:
-  method: sigmoid   # isotonic | sigmoid
-  beta:   2          # F-beta for threshold tuning (beta=2 weights recall 4x over precision)
+threshold:
+  beta: 2   # F-beta for threshold tuning (beta=2 weights recall 4x over precision)

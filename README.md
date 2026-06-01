@@ -74,7 +74,7 @@ All features in `src/features.py` are computed **leak-free** — only prior tran
 1. **Load** raw transaction and identity CSVs
 2. **Feature engineering** — all features above, computed leak-free via `build_features`
 3. **Prepare** — drop >99% missing columns, drop constant columns, encode categoricals
-4. **Time-based split** — 70/10/20 train/cal/test chronological split (no random shuffling)
+4. **Time-based split** — 80/20 train/test chronological split (no random shuffling)
 5. **SHAP feature selection** — top 100 features by mean |SHAP| value; cached to disk
 6. **Tune** — Optuna (50 trials, TimeSeriesSplit 5-fold) per model: LightGBM, XGBoost
 7. **Train** stacking ensemble — base models with early stopping, then XGBoost meta-learner on OOF predictions
