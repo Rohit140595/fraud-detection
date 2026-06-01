@@ -132,11 +132,55 @@ uvicorn src.api:app --reload
 # POST to http://localhost:8000/predict
 ```
 
-**Run streaming simulation:**
+**Run streaming simulation (Layer 4):**
 ```bash
 # Start the API first, then:
 jupyter notebook notebooks/streaming_simulation.ipynb
 ```
+
+**Run Kafka pipeline (Layer 5):**
+```bash
+# 1. Start Kafka
+docker-compose up -d
+
+# 2. Start the consumer/scorer (terminal 1)
+python -m src.kafka_consumer --offset earliest
+
+# 3. Stream transactions from the test set (terminal 2)
+python -m src.kafka_producer --n 500 --delay 100   # 500 rows, 100ms apart
+
+# 4. Tail the fraud-scores topic to see results (terminal 3)
+docker exec fraud-kafka kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 \
+    --topic fraud-scores
+```
+
+## Kafka Architecture
+
+```
+test_features.parquet
+        │
+        ▼
+┌─────────────────┐        raw-transactions topic
+│  kafka_producer │ ──────────────────────────────►┐
+└─────────────────┘                                 │
+                                                    ▼
+                                         ┌──────────────────┐
+                                         │  kafka_consumer  │
+                                         │  (loads ensemble │
+                                         │   at startup)    │
+                                         └────────┬─────────┘
+                                                  │
+                                                  ▼
+                                         fraud-scores topic
+                                  { fraud_probability, is_fraud,
+                                    threshold, latency_ms,
+                                    true_label (for evaluation) }
+```
+
+The consumer scores each transaction directly — no HTTP hop — making it
+suitable for high-throughput production deployments. The FastAPI layer
+remains available for synchronous/external use cases.
 
 ## Key Design Decisions
 
