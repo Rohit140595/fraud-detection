@@ -1,18 +1,17 @@
 """
-Soft-voting ensemble for fraud detection (LightGBM + XGBoost + CatBoost).
+Stacking ensemble for fraud detection (LightGBM + XGBoost, meta: XGBoost).
 
 Design decisions:
   - Category columns are ordinal-encoded to integers before any model sees them.
     Encoding is fit on X_train and applied to test/val to keep codes consistent.
   - LightGBM: receives integer-encoded cats + categorical_feature list → categorical splits.
   - XGBoost:  receives integers, treated as continuous — standard and effective for trees.
-  - CatBoost: receives integers + cat_features constructor arg → ordered target encoding.
-  - Soft voting: averages predict_proba[:, 1] across all three models.
+  - Stacking: OOF predictions from TimeSeriesSplit folds feed a shallow XGBoost meta-learner.
   - Each model tuned independently with the same 5-param Optuna grid mapped to
     framework-specific names. Same TimeSeriesSplit(n_splits=5) + PR-AUC objective
     as the single-model tuner in model.py.
-  - scale_pos_weight (LightGBM / XGBoost) and class_weights (CatBoost) are always
-    derived from the training class ratio — not tuned.
+  - scale_pos_weight (LightGBM / XGBoost) is always derived from the training class
+    ratio — not tuned.
   - Early stopping only in train_ensemble (not during Optuna trials), consistent
     with model.py's tune_hyperparameters.
   - Single-model pipeline in model.py is untouched. To revert, call train() from
@@ -29,7 +28,6 @@ import numpy as np
 import optuna
 import lightgbm as lgb
 import xgboost as xgb
-from catboost import CatBoostClassifier
 import matplotlib.pyplot as plt
 import pandas as pd
 from sklearn.calibration import calibration_curve
@@ -54,7 +52,7 @@ def encode_for_ensemble(
 
     Encoding is fit on X_train's category labels, then applied to X_test using
     the same mapping — prevents code mismatches if X_test contains categories
-    not seen in X_train (those map to -1, which all three models treat as missing).
+    not seen in X_train (those map to -1, which both models treat as missing).
 
     Args:
         X_train: Training features with 'category' dtype columns.
@@ -86,7 +84,7 @@ def encode_for_ensemble(
 # ── Shared CV helper ───────────────────────────────────────────────────────────
 
 def _pr_auc_cv(model_cls, params: dict, X_train: pd.DataFrame, y_train: pd.Series) -> float:
-    """3-fold time-series cross-validation, returns mean PR-AUC."""
+    """5-fold time-series cross-validation, returns mean PR-AUC."""
     tscv = TimeSeriesSplit(n_splits=5)
     pr_aucs = []
     for train_idx, val_idx in tscv.split(X_train):
@@ -131,6 +129,7 @@ def _tune_xgb(X_train, y_train, n_trials: int, scale_pos_weight: float) -> dict:
             "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
             "scale_pos_weight": scale_pos_weight,
+            "tree_method":      "hist",         # histogram splits — much faster than 'exact'
             "random_state": RANDOM_STATE, "n_jobs": -1, "verbosity": 0,
             # No early_stopping_rounds — fit() has no eval_set during CV
         }
@@ -143,31 +142,6 @@ def _tune_xgb(X_train, y_train, n_trials: int, scale_pos_weight: float) -> dict:
     return study.best_params
 
 
-def _tune_catboost(
-    X_train, y_train, n_trials: int, scale_pos_weight: float, cat_cols: list[str],
-) -> dict:
-    def objective(trial):
-        params = {
-            "iterations":        trial.suggest_int("iterations", 100, 500),
-            "depth":             trial.suggest_int("depth", 3, 10),
-            "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "subsample":         trial.suggest_float("subsample", 0.5, 1.0),
-            "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.5, 1.0),
-            "bootstrap_type":    "Bernoulli",   # required for subsample to take effect
-            "class_weights":     [1.0, scale_pos_weight],
-            "cat_features":      cat_cols,
-            "random_seed": RANDOM_STATE, "verbose": 0,
-            # No early_stopping_rounds — fit() has no eval_set during CV
-        }
-        return _pr_auc_cv(CatBoostClassifier, params, X_train, y_train)
-
-    study = optuna.create_study(direction="maximize",
-                                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE + 2))
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-    print(f"  CatBoost best PR-AUC : {study.best_value:.4f}  {study.best_params}")
-    return study.best_params
-
-
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def tune_all(
@@ -177,23 +151,23 @@ def tune_all(
     n_trials: int = 50,
 ) -> dict[str, dict]:
     """
-    Tune LightGBM, XGBoost, and CatBoost independently using Optuna.
+    Tune LightGBM and XGBoost independently using Optuna.
 
-    All three use the same 5-parameter grid philosophy and
+    Both use the same 5-parameter grid philosophy and
     TimeSeriesSplit(n_splits=5) + PR-AUC objective — consistent with
     tune_hyperparameters() in model.py.
 
-    scale_pos_weight / class_weights are fixed (derived from class ratio),
-    not tuned — they are data properties, not model complexity knobs.
+    scale_pos_weight is fixed (derived from class ratio), not tuned —
+    it is a data property, not a model complexity knob.
 
     Args:
         X_train:  Training features (integer-encoded, from encode_for_ensemble).
         y_train:  Training labels.
         cat_cols: Categorical column names (from encode_for_ensemble).
-        n_trials: Optuna trials per model (default 50, ~3 × 50 = 150 total trials).
+        n_trials: Optuna trials per model (default 50, ~2 × 50 = 100 total trials).
 
     Returns:
-        {"lgbm": best_params, "xgb": best_params, "catboost": best_params}
+        {"lgbm": best_params, "xgb": best_params}
     """
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
@@ -205,10 +179,7 @@ def tune_all(
     print(f"\nTuning XGBoost   ({n_trials} trials) ...")
     xgb_params = _tune_xgb(X_train, y_train, n_trials, spw)
 
-    print(f"\nTuning CatBoost  ({n_trials} trials) ...")
-    catboost_params = _tune_catboost(X_train, y_train, n_trials, spw, cat_cols)
-
-    return {"lgbm": lgbm_params, "xgb": xgb_params, "catboost": catboost_params}
+    return {"lgbm": lgbm_params, "xgb": xgb_params}
 
 
 def train_ensemble(
@@ -220,7 +191,7 @@ def train_ensemble(
     cat_cols: list[str],
 ) -> dict[str, object]:
     """
-    Train LightGBM, XGBoost, and CatBoost with early stopping on the validation set.
+    Train LightGBM and XGBoost with early stopping on the validation set.
 
     Merges tuned hyperparameters (from tune_all) with sensible defaults, then
     trains with early_stopping_rounds=50 to prevent overfitting.
@@ -232,7 +203,7 @@ def train_ensemble(
         cat_cols:         Categorical column names (from encode_for_ensemble).
 
     Returns:
-        {"lgbm": fitted_model, "xgb": fitted_model, "catboost": fitted_model}
+        {"lgbm": fitted_model, "xgb": fitted_model}
     """
     neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
     spw = neg / pos
@@ -267,29 +238,121 @@ def train_ensemble(
         "verbosity": 0, "eval_metric": "aucpr", "early_stopping_rounds": 50,
     }
     xgb_p.update(best_params.get("xgb", {}))
-    xgb_p["scale_pos_weight"]    = spw
+    xgb_p["scale_pos_weight"]      = spw
     xgb_p["early_stopping_rounds"] = 50   # re-enforce after update
 
     xgb_model = xgb.XGBClassifier(**xgb_p)
     xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
-    # ── CatBoost ──────────────────────────────────────────────────────────────
-    print("\nTraining CatBoost ...")
-    cat_p = {
-        "iterations": 1000, "learning_rate": 0.05,
-        "class_weights": [1.0, spw], "bootstrap_type": "Bernoulli",
-        "cat_features": cat_cols, "random_seed": RANDOM_STATE, "verbose": 0,
-        "early_stopping_rounds": 50,
-    }
-    cat_p.update(best_params.get("catboost", {}))
-    cat_p["class_weights"]         = [1.0, spw]   # always from data
-    cat_p["cat_features"]          = cat_cols       # always from encoding
-    cat_p["early_stopping_rounds"] = 50
+    return {"lgbm": lgbm_model, "xgb": xgb_model}
 
-    catboost_model = CatBoostClassifier(**cat_p)
-    catboost_model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
 
-    return {"lgbm": lgbm_model, "xgb": xgb_model, "catboost": catboost_model}
+def generate_oof_predictions(
+    best_params: dict[str, dict],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    cat_cols: list[str],
+    n_splits: int = 5,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Generate out-of-fold predictions for each base model using TimeSeriesSplit.
+
+    Refits each model on each fold's training portion using the tuned hyperparameters
+    from tune_all(), then predicts on the held-out portion. The first ~1/(n_splits+1)
+    rows appear only in training folds and are excluded from the returned OOF frame.
+
+    Args:
+        best_params: Output of tune_all().
+        X_train:     Training features (integer-encoded, from encode_for_ensemble).
+        y_train:     Training labels.
+        cat_cols:    Categorical column names.
+        n_splits:    Number of time-series folds (default 5).
+
+    Returns:
+        (oof_df, y_oof)
+        oof_df: DataFrame with columns lgbm_oof, xgb_oof.
+        y_oof:  Matching true labels.
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
+    spw = neg / pos
+
+    oof_preds = np.full((len(X_train), 2), np.nan)
+
+    for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_train)):
+        print(f"  OOF fold {fold + 1}/{n_splits} ...")
+        X_tr  = X_train.iloc[tr_idx]
+        X_val = X_train.iloc[val_idx]
+        y_tr  = y_train.iloc[tr_idx]
+
+        # LightGBM
+        lgbm_p = {
+            "bagging_freq": 1, "scale_pos_weight": spw,
+            "random_state": RANDOM_STATE, "n_jobs": -1, "verbose": -1,
+        }
+        lgbm_p.update(best_params.get("lgbm", {}))
+        lgbm_p["scale_pos_weight"] = spw
+        lgbm_p["bagging_freq"]     = 1
+        lgbm_m = lgb.LGBMClassifier(**lgbm_p)
+        fit_kw = {}
+        if cat_cols:
+            fit_kw["categorical_feature"] = cat_cols
+        lgbm_m.fit(X_tr, y_tr, **fit_kw)
+        oof_preds[val_idx, 0] = lgbm_m.predict_proba(X_val)[:, 1]
+
+        # XGBoost
+        xgb_p = {
+            "scale_pos_weight": spw, "tree_method": "hist",
+            "random_state": RANDOM_STATE, "n_jobs": -1, "verbosity": 0,
+        }
+        xgb_p.update(best_params.get("xgb", {}))
+        xgb_p["scale_pos_weight"] = spw
+        xgb_m = xgb.XGBClassifier(**xgb_p)
+        xgb_m.fit(X_tr, y_tr)
+        oof_preds[val_idx, 1] = xgb_m.predict_proba(X_val)[:, 1]
+
+    valid_mask = ~np.isnan(oof_preds[:, 0])
+    oof_df = pd.DataFrame(
+        oof_preds[valid_mask],
+        columns=["lgbm_oof", "xgb_oof"],
+        index=X_train.index[valid_mask],
+    )
+    y_oof = y_train.loc[oof_df.index]
+
+    pct = len(oof_df) / len(X_train)
+    print(f"  OOF coverage: {len(oof_df):,} / {len(X_train):,} rows ({pct:.1%})")
+    return oof_df, y_oof
+
+
+def train_meta_learner(oof_df: pd.DataFrame, y_oof: pd.Series) -> xgb.XGBClassifier:
+    """
+    Train an XGBoost meta-learner on out-of-fold base-model predictions.
+
+    Shallow (max_depth=3) to blend rather than re-learn — prevents the meta-learner
+    from overfitting the OOF signal.
+
+    Args:
+        oof_df: Output of generate_oof_predictions() (columns: lgbm_oof, xgb_oof).
+        y_oof:  Corresponding true labels.
+
+    Returns:
+        Fitted XGBClassifier meta-learner.
+    """
+    # No scale_pos_weight — inputs are already probability-like OOF scores from
+    # base models that handled class imbalance themselves. Re-applying it pushes
+    # meta-learner outputs to extremes and degrades calibration.
+    meta = xgb.XGBClassifier(
+        n_estimators=100,
+        max_depth=3,
+        learning_rate=0.1,
+        tree_method="hist",
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbosity=0,
+    )
+    meta.fit(oof_df, y_oof)
+    print(f"Meta-learner trained on {len(oof_df):,} OOF rows.")
+    return meta
 
 
 def predict_proba_ensemble(models: dict, X: pd.DataFrame) -> np.ndarray:
@@ -305,6 +368,32 @@ def predict_proba_ensemble(models: dict, X: pd.DataFrame) -> np.ndarray:
     """
     probs = [model.predict_proba(X)[:, 1] for model in models.values()]
     return np.mean(probs, axis=0)
+
+
+def predict_stack(
+    base_models: dict,
+    meta_learner: xgb.XGBClassifier,
+    X: pd.DataFrame,
+) -> np.ndarray:
+    """
+    Score new data through the stacking pipeline.
+
+    Collects predict_proba[:, 1] from each base model, assembles them as a
+    2-column meta-feature matrix (lgbm_oof, xgb_oof), and passes it through the meta-learner.
+
+    Args:
+        base_models:  Dict from train_ensemble (lgbm, xgb).
+        meta_learner: Fitted XGBClassifier from train_meta_learner.
+        X:            Integer-encoded features (same schema as training).
+
+    Returns:
+        1-D array of stacked fraud probabilities.
+    """
+    meta_input = pd.DataFrame({
+        "lgbm_oof": base_models["lgbm"].predict_proba(X)[:, 1],
+        "xgb_oof":  base_models["xgb"].predict_proba(X)[:, 1],
+    })
+    return meta_learner.predict_proba(meta_input)[:, 1]
 
 
 def apply_calibrator(calibrator, raw_probs: np.ndarray) -> np.ndarray:
@@ -334,6 +423,7 @@ def evaluate_ensemble(
     y_test: pd.Series,
     threshold: float = 0.5,
     plot: bool = True,
+    meta_learner: Optional[xgb.XGBClassifier] = None,
 ) -> dict:
     """
     Evaluate the ensemble using PR-AUC and ROC-AUC.
@@ -348,7 +438,9 @@ def evaluate_ensemble(
     Returns:
         Dict with pr_auc and roc_auc.
     """
-    y_prob = predict_proba_ensemble(models, X_test)
+    y_prob = (predict_stack(models, meta_learner, X_test)
+              if meta_learner is not None
+              else predict_proba_ensemble(models, X_test))
 
     precision, recall, _ = precision_recall_curve(y_test, y_prob)
     pr_auc  = auc(recall, precision)
@@ -379,6 +471,7 @@ def calibrate_ensemble(
     X_cal: pd.DataFrame,
     y_cal: pd.Series,
     method: str = "isotonic",
+    meta_learner: Optional[xgb.XGBClassifier] = None,
 ) -> IsotonicRegression | LogisticRegression:
     """
     Fit a post-hoc calibrator on raw ensemble scores from the calibration set.
@@ -402,7 +495,9 @@ def calibrate_ensemble(
         (calibrator, cal_metrics) where cal_metrics contains brier_before and
         brier_after so the caller can log them without recomputing.
     """
-    raw_probs = predict_proba_ensemble(models, X_cal)
+    raw_probs = (predict_stack(models, meta_learner, X_cal)
+                 if meta_learner is not None
+                 else predict_proba_ensemble(models, X_cal))
 
     if method == "isotonic":
         calibrator = IsotonicRegression(out_of_bounds="clip")
@@ -522,18 +617,21 @@ def save_ensemble(
     cat_encoders: dict,
     calibrator: Optional[object] = None,
     threshold: float = 0.5,
+    meta_learner: Optional[xgb.XGBClassifier] = None,
     path: Path = ENSEMBLE_PATH,
 ) -> None:
-    """Persist the ensemble, cat_cols, cat_encoders, calibrator, and threshold to disk."""
+    """Persist the ensemble, cat_cols, cat_encoders, calibrator, meta_learner, and threshold to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({
-        "models":      models,
-        "cat_cols":    cat_cols,
+        "models":       models,
+        "cat_cols":     cat_cols,
         "cat_encoders": cat_encoders,
-        "calibrator":  calibrator,
-        "threshold":   threshold,
+        "calibrator":   calibrator,
+        "threshold":    threshold,
+        "meta_learner": meta_learner,
     }, path)
-    print(f"Ensemble saved to {path}  ({len(models)} models, threshold={threshold:.4f})")
+    mode = "stacking" if meta_learner is not None else "soft_vote"
+    print(f"Ensemble saved to {path}  ({len(models)} models, {mode}, threshold={threshold:.4f})")
 
 
 def load_ensemble(path: Path = ENSEMBLE_PATH) -> tuple:
@@ -541,9 +639,10 @@ def load_ensemble(path: Path = ENSEMBLE_PATH) -> tuple:
     Load a persisted ensemble from disk.
 
     Returns:
-        (models, cat_cols, cat_encoders, calibrator, threshold)
-        calibrator: fitted IsotonicRegression / LogisticRegression, or None.
-        threshold:  saved decision threshold (defaults to 0.5 if not present).
+        (models, cat_cols, cat_encoders, calibrator, threshold, meta_learner)
+        calibrator:   fitted IsotonicRegression / LogisticRegression, or None.
+        threshold:    saved decision threshold (defaults to 0.5 if not present).
+        meta_learner: fitted XGBClassifier stacking meta-learner, or None.
     """
     data = joblib.load(path)
     return (
@@ -552,4 +651,5 @@ def load_ensemble(path: Path = ENSEMBLE_PATH) -> tuple:
         data.get("cat_encoders", {}),
         data.get("calibrator", None),
         data.get("threshold", 0.5),
+        data.get("meta_learner", None),
     )

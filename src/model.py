@@ -64,6 +64,30 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def two_way_split(
+    df: pd.DataFrame,
+    train_frac: float = 0.80,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split data chronologically into train / test sets.
+
+    All cuts are strictly ordered by TransactionDT so no future information
+    leaks into earlier splits.
+
+    Args:
+        df:          Prepared feature DataFrame (must contain 'TransactionDT').
+        train_frac:  Fraction of rows for training (default 0.80).
+                     Remainder (1 - train_frac) goes to test.
+
+    Returns:
+        (train, test) DataFrames.
+    """
+    df = df.sort_values("TransactionDT").reset_index(drop=True)
+    n = len(df)
+    train_end = int(n * train_frac)
+    return df.iloc[:train_end], df.iloc[train_end:]
+
+
 def three_way_split(
     df: pd.DataFrame,
     train_frac: float = 0.70,

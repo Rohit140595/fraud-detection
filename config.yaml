@@ -5,21 +5,21 @@ paths:
   shap_cache: models/shap_features.json
 
 split:
-  train_frac: 0.70
-  cal_frac:   0.10
+  train_frac: 0.80
   # test_frac: 0.20 (remainder)
 
 feature_selection:
-  top_n: 40
-  sample_size: 50000
+  top_n: 100
+  sample_size: 100000
 
 tuning:
-  n_trials: 50
-  n_cv_splits: 5
+  n_trials:       50
+  n_trials_quick: 3       # fast sanity-check run (~5 min)
+  quick_test:     false    # true = use n_trials_quick + 5K SHAP sample; false = full run
+  n_cv_splits:    5
 
 ensemble:
   threshold: 0.5
 
-calibration:
-  method: sigmoid   # isotonic | sigmoid
-  beta:   2          # F-beta for threshold tuning (beta=2 weights recall 4x over precision)
+threshold:
+  beta: 2   # F-beta for threshold tuning (beta=2 weights recall 4x over precision)

@@ -6,8 +6,9 @@ End-to-end ML pipeline for real-time transaction fraud detection, built on the [
 
 | Metric | Score |
 |---|---|
-| **PR-AUC** | **0.5603** |
+| **PR-AUC** | **0.5712** |
 | ROC-AUC | 0.9100 |
+| Precision / Recall (F2 threshold) | 0.436 / 0.614 |
 | Fraud rate (test set) | 3.44% |
 
 Primary metric is PR-AUC — more informative than ROC-AUC on heavily imbalanced data since it focuses on the minority class and is not inflated by the large number of true negatives.
@@ -22,7 +23,7 @@ fraud-detection/
 │   ├── train_identity.csv
 │   └── test_features.parquet        # Pre-engineered test set for streaming simulation
 ├── models/                          # Saved artifacts (not tracked — regenerable)
-│   ├── ensemble_fraud.pkl           # Trained ensemble (LightGBM + XGBoost + CatBoost)
+│   ├── ensemble_fraud.pkl           # Trained ensemble (LightGBM + XGBoost, meta: XGBoost)
 │   └── shap_features.json           # SHAP feature selection cache
 ├── notebooks/
 │   ├── data_exploration.ipynb       # EDA: class imbalance, missing data, distributions
@@ -57,6 +58,10 @@ All features in `src/features.py` are computed **leak-free** — only prior tran
 | `is_free_email` | 1 if purchaser uses a free provider (gmail, yahoo, hotmail, etc.) |
 | `amt_cents` | Fractional cents portion of `TransactionAmt` |
 | `is_round_amt` | 1 if transaction amount has no cents |
+| `dt_card1_last` | Seconds since the previous transaction on the same card1 |
+| `dt_uid_last` | Seconds since the previous transaction for the same UID (card + addr + email) |
+| `uid_D{n}_mean` | Expanding mean of D1–D9 per UID up to but not including the current transaction |
+| `uid_D{n}_std` | Expanding std of D1–D9 per UID up to but not including the current transaction |
 | `log_D{n}` | Log-transformed days-since columns D1–D9 (compresses right skew) |
 | `D{n}_null_flag` | 1 when D column is missing — distinguishes absence from zero |
 | `is_unknown_os` | 1 when DeviceInfo is absent (no device fingerprint available) |
@@ -70,10 +75,10 @@ All features in `src/features.py` are computed **leak-free** — only prior tran
 1. **Load** raw transaction and identity CSVs
 2. **Feature engineering** — all features above, computed leak-free via `build_features`
 3. **Prepare** — drop >99% missing columns, drop constant columns, encode categoricals
-4. **Time-based split** — 80/20 chronological split (no random shuffling)
-5. **SHAP feature selection** — top 40 features by mean |SHAP| value; cached to disk
-6. **Tune** — Optuna (50 trials, TimeSeriesSplit 5-fold) per model: LightGBM, XGBoost, CatBoost
-7. **Train** soft-voting ensemble with best params + early stopping
+4. **Time-based split** — 80/20 train/test chronological split (no random shuffling)
+5. **SHAP feature selection** — top 100 features by mean |SHAP| value; cached to disk
+6. **Tune** — Optuna (50 trials, TimeSeriesSplit 5-fold) per model: LightGBM, XGBoost
+7. **Train** stacking ensemble — base models with early stopping, then XGBoost meta-learner on OOF predictions
 8. **Evaluate** — PR-AUC and ROC-AUC on held-out test set
 9. **Save** ensemble to `models/ensemble_fraud.pkl`
 
@@ -87,11 +92,15 @@ Transaction ──────────► │  FastAPI    │
                                │ feature engineering
                                ▼
                         ┌─────────────┐
-                        │  Ensemble   │
-                        │  LightGBM   │──► avg(predict_proba)
-                        │  XGBoost    │──► fraud_probability
-                        │  CatBoost   │
-                        └─────────────┘
+                        │  Base models│
+                        │  LightGBM   │──► lgbm_prob ─┐
+                        │  XGBoost    │──► xgb_prob  ─┤
+                        └─────────────┘               │
+                                                       ▼
+                                               ┌──────────────┐
+                                               │ Meta-learner │
+                                               │  XGBoost     │──► fraud_probability
+                                               └──────────────┘
 ```
 
 The API accepts raw transaction fields plus optional behavioral features (velocity, historical mean amount) that the caller pre-fetches from a history store (e.g., Redis). Static features are computed server-side.
@@ -133,7 +142,7 @@ jupyter notebook notebooks/streaming_simulation.ipynb
 
 - **Time-based split over random split** — behavioral features (velocity, historical mean) would leak future information into training if rows were shuffled.
 - **SHAP feature selection** — ranks features by actual prediction contribution (mean |SHAP|) rather than split counts, which is biased toward high-cardinality features.
-- **Soft-voting ensemble** — LightGBM, XGBoost, and CatBoost each make different errors; averaging probabilities reduces variance without requiring a meta-learner.
+- **Stacking ensemble** — LightGBM and XGBoost base models generate out-of-fold predictions via TimeSeriesSplit; a shallow XGBoost meta-learner (max_depth=3) learns to blend them. No `scale_pos_weight` on the meta-learner — OOF inputs are already probability-like scores from base models that handled class imbalance themselves.
 - **`scale_pos_weight = neg / pos`** — handles 3.5% class imbalance without SMOTE, which is unreliable on mixed/missing data.
 - **`TimeSeriesSplit` in Optuna** — each CV fold's validation is strictly later than its training data, consistent with production temporal ordering.
 - **SHAP cache** — `models/shap_features.json` stores the selected features so SHAP only runs once; subsequent notebook runs load from cache instantly.

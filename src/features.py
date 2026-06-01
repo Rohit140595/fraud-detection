@@ -1,12 +1,15 @@
 """
 Feature engineering for real-time fraud detection.
 
-Two core feature families:
-  - Velocity   : how many transactions has this user made in the last N seconds?
-  - Deviation  : how far is this transaction amount from the user's historical mean?
+Three core feature families:
+  - Velocity        : how many transactions has this user made in the last N seconds?
+  - Deviation       : how far is this transaction amount from the user's historical mean?
+  - D-col aggregates: expanding mean/std of D1–D9 (days-since features) per user.
 
-Both are computed in a leak-free way — only prior transactions are used.
+All three are computed in a leak-free way — only prior transactions are used.
 """
+
+from __future__ import annotations
 
 from bisect import bisect_left
 import pandas as pd
@@ -391,6 +394,174 @@ def compute_identity_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_uid_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create a fine-grained user identity proxy combining card, address, and email.
+
+    card_addr (card1 + addr1) identifies the cardholder but collides when the
+    same card is used at multiple billing addresses. Adding P_emaildomain creates
+    a tighter proxy that separates genuine users from account-takeover patterns
+    where the email domain changes mid-session.
+
+    The uid string is intentionally kept as-is (high cardinality). It serves as a
+    grouping key for time-delta and frequency encoding — not as a direct model
+    feature. Drop it after those encoding steps are complete.
+
+    Args:
+        df: DataFrame containing card1, addr1, and P_emaildomain.
+
+    Returns:
+        DataFrame with 'uid' column added.
+    """
+    df = df.copy()
+    card1 = df["card1"].astype(str)
+    addr1 = df["addr1"].astype(str) if "addr1" in df.columns else pd.Series("nan", index=df.index)
+    email = df["P_emaildomain"].astype(str) if "P_emaildomain" in df.columns else pd.Series("nan", index=df.index)
+    df["uid"] = card1 + "_" + addr1 + "_" + email
+    return df
+
+
+def compute_time_deltas(
+    df: pd.DataFrame,
+    group_cols: list | None = None,
+    time_col: str = "TransactionDT",
+) -> pd.DataFrame:
+    """
+    Time elapsed (seconds) since each user's previous transaction.
+
+    Burst patterns — many transactions in quick succession — are a strong fraud
+    signal. A very small delta means the card is being charged unusually fast;
+    NaN means this is the user's first transaction on record.
+
+    Uses shift(1) within each time-sorted group — leak-free by construction:
+    the current transaction never contributes to its own delta.
+
+    Args:
+        df:         DataFrame containing time_col and the group columns.
+        group_cols: Columns to group by (default: card1, uid).
+        time_col:   Transaction timestamp column in seconds.
+
+    Returns:
+        DataFrame with dt_{col}_last columns added for each group column.
+    """
+    if group_cols is None:
+        group_cols = ["card1", "uid"]
+
+    df = df.sort_values(time_col).copy()
+
+    for col in group_cols:
+        if col not in df.columns:
+            continue
+        delta_col = f"dt_{col}_last"
+        df[delta_col] = df.groupby(col)[time_col].transform(
+            lambda x: x - x.shift(1)
+        )
+        # First transaction per group → NaN; both models handle NaN natively.
+
+    return df
+
+
+# ── Stateful encoders (fit on X_train, apply to cal / test) ───────────────────
+
+def fit_freq_encoders(
+    X_train: pd.DataFrame,
+    cols: list | None = None,
+) -> dict:
+    """
+    Fit frequency (count) encoders from training data.
+
+    A card, address, or device fingerprint that appears rarely in the training set
+    is more suspicious than one seen thousands of times. Frequency encoding turns
+    this intuition into a numeric signal without the high-cardinality problems of
+    raw categorical columns.
+
+    Encoders are fit on X_train only — val/test sets use training-set frequencies
+    so there is no leakage. Unseen values map to 0.
+
+    Args:
+        X_train: Training feature matrix (post-split).
+        cols:    Columns to encode. Defaults to the five highest-value columns.
+
+    Returns:
+        Dict mapping each column name to a {value: count} frequency dict.
+    """
+    if cols is None:
+        cols = ["card1", "uid", "P_emaildomain", "addr1", "DeviceInfo"]
+
+    encoders = {}
+    for col in cols:
+        if col in X_train.columns:
+            encoders[col] = X_train[col].value_counts().to_dict()
+    return encoders
+
+
+def apply_freq_encoders(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
+    """
+    Apply frequency encoders — maps each value to its training-set count.
+
+    Unseen values (categories in val/test not seen in train) map to 0.
+
+    Args:
+        df:       Feature matrix to transform.
+        encoders: Dict returned by fit_freq_encoders.
+
+    Returns:
+        DataFrame with {col}_freq columns added for each encoded column.
+    """
+    df = df.copy()
+    for col, freq_map in encoders.items():
+        if col in df.columns:
+            df[f"{col}_freq"] = df[col].map(freq_map).fillna(0).astype(int)
+    return df
+
+
+def compute_d_uid_aggregates(
+    df: pd.DataFrame,
+    group_col: str = "uid",
+    d_cols: list | None = None,
+    time_col: str = "TransactionDT",
+) -> pd.DataFrame:
+    """
+    Expanding mean and std of D columns (days-since features) per user.
+
+    Each row's aggregate uses only that user's prior transactions — leak-free
+    by construction via shift(1) on the time-sorted expanding window. First
+    transaction per user gets NaN (no history); models handle NaN natively.
+
+    This mirrors compute_amount_deviation's approach: compute once on the full
+    dataset so cal/test rows naturally incorporate all earlier training history.
+
+    Args:
+        df:        DataFrame containing time_col, group_col, and D columns.
+        group_col: Column to group by (default: uid).
+        d_cols:    D columns to aggregate (default: D1–D9).
+        time_col:  Column with transaction timestamps in seconds.
+
+    Returns:
+        DataFrame with {group_col}_{d_col}_mean and {group_col}_{d_col}_std added.
+    """
+    if d_cols is None:
+        d_cols = [f"D{i}" for i in range(1, 10)]
+
+    if group_col not in df.columns:
+        return df
+
+    df = df.sort_values(time_col).copy()
+
+    for d_col in d_cols:
+        if d_col not in df.columns:
+            continue
+        prefix = f"{group_col}_{d_col}"
+        df[f"{prefix}_mean"] = df.groupby(group_col)[d_col].transform(
+            lambda x: x.expanding().mean().shift(1)
+        )
+        df[f"{prefix}_std"] = df.groupby(group_col)[d_col].transform(
+            lambda x: x.expanding().std().shift(1)
+        )
+
+    return df
+
+
 def merge_identity(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
     """
     Left join identity features onto transactions.
@@ -420,17 +591,25 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
     Full feature engineering pipeline.
 
     Steps:
-      1. Merge identity features onto transactions (left join, optional)
-      2. Drop confirmed zero-importance id columns (_WEAK_ID_COLS)
-      3. Add user proxy (card_addr)
-      4. Velocity across 1h / 24h / 7d windows
-      5. Amount deviation from historical mean
-      6. Time features (hour of day, day of week, month of year)
-      7. Card-level unique address and amount counts
-      8. Email domain features (match flag, free-provider flag)
-      9. Amount structure features (cents portion, round-number flag)
-     10. D1–D9 features (log-transform, null flag)
-     11. Identity features (is_unknown_os, is_mobile, device_os)
+      1.  Merge identity features onto transactions (left join, optional)
+      2.  Drop confirmed zero-importance id columns (_WEAK_ID_COLS)
+      3.  Add user proxy card_addr (card1 + addr1)
+      4.  Add uid (card1 + addr1 + P_emaildomain) — grouping key for time deltas
+          and post-split frequency / target encodings; drop after those steps.
+      5.  D-column expanding stats — expanding mean/std of D1–D9 per uid (leak-free)
+      6.  Velocity across 1h / 24h / 7d windows (per card_addr)
+      7.  Time deltas — seconds since last transaction per card1 and uid
+      8.  Amount deviation from historical mean
+      9.  Time features (hour of day, day of week, month of year)
+     10.  Card-level unique address and amount counts
+     11.  Email domain features (match flag, free-provider flag)
+     12.  Amount structure features (cents portion, round-number flag)
+     13.  D1–D9 features (log-transform, null flag)
+     14.  Identity features (is_unknown_os, is_mobile, device_os)
+
+    Note: frequency encodings (uid_freq, card1_freq, etc.) are fit after the
+    train/cal/test split to prevent leakage — see the notebook for those steps
+    (fit_freq_encoders).
 
     Args:
         trn: Raw transaction DataFrame.
@@ -449,7 +628,10 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
         print(f"Dropped {len(weak_cols)} weak id columns")
 
     df = add_user_proxy(df)
+    df = compute_uid_features(df)           # uid = card1 + addr1 + email
+    df = compute_d_uid_aggregates(df)       # expanding D-col mean/std per uid (leak-free)
     df = compute_velocity_multi_window(df)
+    df = compute_time_deltas(df)            # dt_card1_last, dt_uid_last
     df = compute_amount_deviation(df)
     df = compute_time_features(df)
     df = compute_card_aggregates(df)
