@@ -139,6 +139,14 @@ def _score_transaction(
     }
 
 
+def _safe_deserialize(raw: bytes):
+    """Return parsed JSON dict, or None if the message is not valid JSON."""
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
 def run_consumer(
     bootstrap_servers: str = DEFAULT_BOOTSTRAP,
     input_topic:  str = DEFAULT_INPUT_TOPIC,
@@ -168,7 +176,7 @@ def run_consumer(
         bootstrap_servers=bootstrap_servers,
         group_id=group_id,
         auto_offset_reset=auto_offset_reset,
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        value_deserializer=lambda v: _safe_deserialize(v),
         enable_auto_commit=True,
     )
     producer = KafkaProducer(
@@ -181,7 +189,13 @@ def run_consumer(
 
     try:
         for msg in consumer:
+            # Skip messages that failed deserialization (e.g. plain-text or empty)
+            if msg.value is None:
+                continue
             envelope   = msg.value
+            # Skip messages that don't match our envelope schema
+            if "transaction" not in envelope:
+                continue
             payload    = dict(envelope.get("transaction", {}))
             true_label = payload.pop("_true_label", None)
 
