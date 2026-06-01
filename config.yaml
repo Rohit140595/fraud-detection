@@ -10,8 +10,8 @@ split:
   # test_frac: 0.20 (remainder)
 
 feature_selection:
-  top_n: 40
-  sample_size: 50000
+  top_n: 100
+  sample_size: 100000
 
 tuning:
   n_trials:       50

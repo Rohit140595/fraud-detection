@@ -61,7 +61,8 @@ async def lifespan(app: FastAPI):
     the model file is missing — rather than failing silently on the first request.
     """
     (app.state.models, app.state.cat_cols, app.state.cat_encoders,
-     app.state.calibrator, app.state.threshold) = load_ensemble()
+     app.state.calibrator, app.state.threshold,
+     app.state.meta_learner) = load_ensemble()
     yield
 
 
@@ -148,9 +149,9 @@ def predict(request: TransactionRequest):
       3. Create a single-row DataFrame and coerce numeric dtypes (None → NaN).
       4. Run static feature engineering: user proxy, time, email, amount, D1.
       5. Ordinal-encode categorical columns using the codes saved at training time.
-      6. Align columns to the ensemble's expected feature set (reindex fills gaps
-         with NaN — all three models handle NaN natively).
-      7. Average predict_proba across LightGBM, XGBoost, and CatBoost (soft vote).
+      6. Align columns to each model's expected feature set (reindex fills gaps
+         with NaN — both models handle NaN natively).
+      7. Score through meta-learner (stacking) or average LightGBM + XGBoost (soft vote).
 
     Args:
         request: Validated TransactionRequest payload.
@@ -185,26 +186,21 @@ def predict(request: TransactionRequest):
             encoder = app.state.cat_encoders.get(col, {})
             df[col] = df[col].map(encoder).fillna(-1).astype(int)
 
-    # 6 & 7. Score: average predict_proba across all ensemble models (soft vote).
+    # 6 & 7. Score through ensemble models.
     lgbm_m = app.state.models["lgbm"]
     xgb_m  = app.state.models["xgb"]
-    cat_m  = app.state.models["catboost"]
 
     lgbm_df = df.reindex(columns=lgbm_m.feature_names_in_)
     xgb_df  = df.reindex(columns=xgb_m.feature_names_in_)
-    cat_df  = df.reindex(columns=cat_m.feature_names_)
 
-    # CatBoost rejects float NaN for declared cat_features — reindex fills missing
-    # columns with NaN, so explicitly replace with -1 (unseen-category sentinel).
-    for col in app.state.cat_cols:
-        if col in cat_df.columns:
-            cat_df[col] = cat_df[col].fillna(-1).astype(int)
+    lgbm_prob = lgbm_m.predict_proba(lgbm_df)[0, 1]
+    xgb_prob  = xgb_m.predict_proba(xgb_df)[0, 1]
 
-    raw_prob = (
-        lgbm_m.predict_proba(lgbm_df)[0, 1]
-        + xgb_m.predict_proba(xgb_df)[0, 1]
-        + cat_m.predict_proba(cat_df)[0, 1]
-    ) / 3.0
+    if app.state.meta_learner is not None:
+        meta_in  = pd.DataFrame({"lgbm_oof": [lgbm_prob], "xgb_oof": [xgb_prob]})
+        raw_prob = float(app.state.meta_learner.predict_proba(meta_in)[0, 1])
+    else:
+        raw_prob = (lgbm_prob + xgb_prob) / 2.0
 
     # 8. Apply calibration if a calibrator was saved with the model.
     if app.state.calibrator is not None:

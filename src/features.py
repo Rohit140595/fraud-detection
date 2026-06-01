@@ -1,11 +1,12 @@
 """
 Feature engineering for real-time fraud detection.
 
-Two core feature families:
-  - Velocity   : how many transactions has this user made in the last N seconds?
-  - Deviation  : how far is this transaction amount from the user's historical mean?
+Three core feature families:
+  - Velocity        : how many transactions has this user made in the last N seconds?
+  - Deviation       : how far is this transaction amount from the user's historical mean?
+  - D-col aggregates: expanding mean/std of D1–D9 (days-since features) per user.
 
-Both are computed in a leak-free way — only prior transactions are used.
+All three are computed in a leak-free way — only prior transactions are used.
 """
 
 from __future__ import annotations
@@ -403,7 +404,7 @@ def compute_uid_features(df: pd.DataFrame) -> pd.DataFrame:
     where the email domain changes mid-session.
 
     The uid string is intentionally kept as-is (high cardinality). It serves as a
-    grouping key for time-delta and target/frequency encoding — not as a direct model
+    grouping key for time-delta and frequency encoding — not as a direct model
     feature. Drop it after those encoding steps are complete.
 
     Args:
@@ -455,7 +456,7 @@ def compute_time_deltas(
         df[delta_col] = df.groupby(col)[time_col].transform(
             lambda x: x - x.shift(1)
         )
-        # First transaction per group → NaN; all three models handle NaN natively.
+        # First transaction per group → NaN; both models handle NaN natively.
 
     return df
 
@@ -514,80 +515,50 @@ def apply_freq_encoders(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
     return df
 
 
-def fit_target_encoders(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    cols: list | None = None,
-    smooth: int = 20,
-) -> tuple:
-    """
-    Fit smoothed target encoders (mean fraud rate per category value).
-
-    Plain mean encoding overfits to rare categories — a category with a single
-    fraud transaction would get rate=1.0. Smoothing pulls each category's mean
-    toward the global rate proportionally:
-
-        smoothed = (n × cat_mean + smooth × global_mean) / (n + smooth)
-
-    A category with n=20 receives half weight from the global mean (smooth=20).
-    High-traffic categories converge to their true rate; rare ones default toward
-    the global baseline, avoiding wild over-estimates.
-
-    Encoders are fit on X_train + y_train only — no future labels leak into
-    cal/test; unseen categories fall back to global_mean.
-
-    Args:
-        X_train: Training feature matrix (post-split).
-        y_train: Training fraud labels (0/1).
-        cols:    Columns to encode. Defaults to card1, uid, P_emaildomain, addr1.
-        smooth:  Smoothing factor (default 20).
-
-    Returns:
-        (encoders, global_mean) where encoders is {col: {value: smoothed_rate}}.
-    """
-    if cols is None:
-        cols = ["card1", "uid", "P_emaildomain", "addr1"]
-
-    global_mean = float(y_train.mean())
-    encoders: dict[str, dict] = {}
-
-    for col in cols:
-        if col not in X_train.columns:
-            continue
-        tmp = pd.DataFrame({"col": X_train[col].values, "target": y_train.values})
-        stats = tmp.groupby("col")["target"].agg(["mean", "count"])
-        smoothed = (
-            (stats["count"] * stats["mean"] + smooth * global_mean)
-            / (stats["count"] + smooth)
-        )
-        encoders[col] = smoothed.to_dict()
-
-    return encoders, global_mean
-
-
-def apply_target_encoders(
+def compute_d_uid_aggregates(
     df: pd.DataFrame,
-    encoders: dict,
-    global_mean: float,
+    group_col: str = "uid",
+    d_cols: list | None = None,
+    time_col: str = "TransactionDT",
 ) -> pd.DataFrame:
     """
-    Apply target encoders — maps each value to its smoothed training fraud rate.
+    Expanding mean and std of D columns (days-since features) per user.
 
-    Unseen values (categories in val/test not seen in train) fall back to
-    global_mean so they are treated as average risk rather than missing.
+    Each row's aggregate uses only that user's prior transactions — leak-free
+    by construction via shift(1) on the time-sorted expanding window. First
+    transaction per user gets NaN (no history); models handle NaN natively.
+
+    This mirrors compute_amount_deviation's approach: compute once on the full
+    dataset so cal/test rows naturally incorporate all earlier training history.
 
     Args:
-        df:          Feature matrix to transform.
-        encoders:    Dict returned by fit_target_encoders.
-        global_mean: Fallback rate for unseen categories.
+        df:        DataFrame containing time_col, group_col, and D columns.
+        group_col: Column to group by (default: uid).
+        d_cols:    D columns to aggregate (default: D1–D9).
+        time_col:  Column with transaction timestamps in seconds.
 
     Returns:
-        DataFrame with {col}_te columns added for each encoded column.
+        DataFrame with {group_col}_{d_col}_mean and {group_col}_{d_col}_std added.
     """
-    df = df.copy()
-    for col, te_map in encoders.items():
-        if col in df.columns:
-            df[f"{col}_te"] = df[col].map(te_map).fillna(global_mean)
+    if d_cols is None:
+        d_cols = [f"D{i}" for i in range(1, 10)]
+
+    if group_col not in df.columns:
+        return df
+
+    df = df.sort_values(time_col).copy()
+
+    for d_col in d_cols:
+        if d_col not in df.columns:
+            continue
+        prefix = f"{group_col}_{d_col}"
+        df[f"{prefix}_mean"] = df.groupby(group_col)[d_col].transform(
+            lambda x: x.expanding().mean().shift(1)
+        )
+        df[f"{prefix}_std"] = df.groupby(group_col)[d_col].transform(
+            lambda x: x.expanding().std().shift(1)
+        )
+
     return df
 
 
@@ -625,19 +596,20 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
       3.  Add user proxy card_addr (card1 + addr1)
       4.  Add uid (card1 + addr1 + P_emaildomain) — grouping key for time deltas
           and post-split frequency / target encodings; drop after those steps.
-      5.  Velocity across 1h / 24h / 7d windows (per card_addr)
-      6.  Time deltas — seconds since last transaction per card1 and uid
-      7.  Amount deviation from historical mean
-      8.  Time features (hour of day, day of week, month of year)
-      9.  Card-level unique address and amount counts
-     10.  Email domain features (match flag, free-provider flag)
-     11.  Amount structure features (cents portion, round-number flag)
-     12.  D1–D9 features (log-transform, null flag)
-     13.  Identity features (is_unknown_os, is_mobile, device_os)
+      5.  D-column expanding stats — expanding mean/std of D1–D9 per uid (leak-free)
+      6.  Velocity across 1h / 24h / 7d windows (per card_addr)
+      7.  Time deltas — seconds since last transaction per card1 and uid
+      8.  Amount deviation from historical mean
+      9.  Time features (hour of day, day of week, month of year)
+     10.  Card-level unique address and amount counts
+     11.  Email domain features (match flag, free-provider flag)
+     12.  Amount structure features (cents portion, round-number flag)
+     13.  D1–D9 features (log-transform, null flag)
+     14.  Identity features (is_unknown_os, is_mobile, device_os)
 
-    Note: frequency and target encodings (uid_freq, card1_te, etc.) are fit
-    after the train/cal/test split to prevent leakage — see the notebook for
-    those steps (fit_freq_encoders / fit_target_encoders).
+    Note: frequency encodings (uid_freq, card1_freq, etc.) are fit after the
+    train/cal/test split to prevent leakage — see the notebook for those steps
+    (fit_freq_encoders).
 
     Args:
         trn: Raw transaction DataFrame.
@@ -657,6 +629,7 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
 
     df = add_user_proxy(df)
     df = compute_uid_features(df)           # uid = card1 + addr1 + email
+    df = compute_d_uid_aggregates(df)       # expanding D-col mean/std per uid (leak-free)
     df = compute_velocity_multi_window(df)
     df = compute_time_deltas(df)            # dt_card1_last, dt_uid_last
     df = compute_amount_deviation(df)
