@@ -1,0 +1,33 @@
+version: '3.8'
+
+# Single-node Kafka in KRaft mode (no Zookeeper required).
+#
+# Usage:
+#   docker-compose up -d          # start Kafka in the background
+#   docker-compose down           # stop and remove containers
+#   docker-compose logs -f kafka  # tail Kafka logs
+
+services:
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: fraud-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft — this node acts as both broker and controller
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
