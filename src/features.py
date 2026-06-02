@@ -1,12 +1,13 @@
 """
 Feature engineering for real-time fraud detection.
 
-Three core feature families:
+Four core feature families:
   - Velocity        : how many transactions has this user made in the last N seconds?
   - Deviation       : how far is this transaction amount from the user's historical mean?
   - D-col aggregates: expanding mean/std of D1–D9 (days-since features) per user.
+  - Graph           : how many distinct cards share the same email/device? (degree features)
 
-All three are computed in a leak-free way — only prior transactions are used.
+All four are computed in a leak-free way — only prior transactions are used.
 """
 
 from __future__ import annotations
@@ -562,6 +563,55 @@ def compute_d_uid_aggregates(
     return df
 
 
+def compute_graph_features(
+    df: pd.DataFrame,
+    time_col: str = "TransactionDT",
+) -> pd.DataFrame:
+    """
+    Graph-based features capturing relationships between cards, emails and devices.
+    
+    Adds:
+        email_degree  : distinct cards that used this email before this transaction
+        card_degree   : distinct emails this card has used before this transaction
+        device_degree : distinct cards that used this device before this transaction
+    """
+    df = df.sort_values(time_col).copy()
+    
+    email_to_cards  = {}   # email  → set of cards seen so far
+    card_to_emails  = {}   # card   → set of emails seen so far
+    device_to_cards = {}   # device → set of cards seen so far
+    
+    email_degrees  = []
+    card_degrees   = []
+    device_degrees = []
+    
+    for _, row in df.iterrows():
+        email  = row.get("P_emaildomain")
+        card   = str(row.get("card1"))
+        device = row.get("DeviceInfo")
+        
+        # Look up how many cards have used this email so far
+        email_degree = len(email_to_cards.get(email, set()))
+        card_degree = len(card_to_emails.get(card, set()))
+        device_degree = len(device_to_cards.get(device, set()))
+        
+        # Append that count to email_degrees
+        email_degrees.append(email_degree)  
+        card_degrees.append(card_degree)
+        device_degrees.append(device_degree)
+        
+        # Update email_to_cards with the current card
+        email_to_cards.setdefault(email, set()).add(card)
+        card_to_emails.setdefault(card, set()).add(email)
+        device_to_cards.setdefault(device, set()).add(card)
+        
+    df["email_degree"]  = email_degrees
+    df["card_degree"]   = card_degrees
+    df["device_degree"] = device_degrees
+    
+    return df
+    
+    
 def merge_identity(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
     """
     Left join identity features onto transactions.
@@ -597,15 +647,16 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
       4.  Add uid (card1 + addr1 + P_emaildomain) — grouping key for time deltas
           and post-split frequency / target encodings; drop after those steps.
       5.  D-column expanding stats — expanding mean/std of D1–D9 per uid (leak-free)
-      6.  Velocity across 1h / 24h / 7d windows (per card_addr)
-      7.  Time deltas — seconds since last transaction per card1 and uid
-      8.  Amount deviation from historical mean
-      9.  Time features (hour of day, day of week, month of year)
-     10.  Card-level unique address and amount counts
-     11.  Email domain features (match flag, free-provider flag)
-     12.  Amount structure features (cents portion, round-number flag)
-     13.  D1–D9 features (log-transform, null flag)
-     14.  Identity features (is_unknown_os, is_mobile, device_os)
+      6.  Graph features — email/card/device degree (distinct entities seen before)
+      7.  Velocity across 1h / 24h / 7d windows (per card_addr)
+      8.  Time deltas — seconds since last transaction per card1 and uid
+      9.  Amount deviation from historical mean
+     10.  Time features (hour of day, day of week, month of year)
+     11.  Card-level unique address and amount counts
+     12.  Email domain features (match flag, free-provider flag)
+     13.  Amount structure features (cents portion, round-number flag)
+     14.  D1–D9 features (log-transform, null flag)
+     15.  Identity features (is_unknown_os, is_mobile, device_os)
 
     Note: frequency encodings (uid_freq, card1_freq, etc.) are fit after the
     train/cal/test split to prevent leakage — see the notebook for those steps
@@ -630,6 +681,7 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
     df = add_user_proxy(df)
     df = compute_uid_features(df)           # uid = card1 + addr1 + email
     df = compute_d_uid_aggregates(df)       # expanding D-col mean/std per uid (leak-free)
+    df = compute_graph_features(df)         # email/card/device degree (leak-free)
     df = compute_velocity_multi_window(df)
     df = compute_time_deltas(df)            # dt_card1_last, dt_uid_last
     df = compute_amount_deviation(df)
