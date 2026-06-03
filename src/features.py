@@ -580,31 +580,28 @@ def compute_graph_features(
     email_to_cards  = {}   # email  → set of cards seen so far
     card_to_emails  = {}   # card   → set of emails seen so far
     device_to_cards = {}   # device → set of cards seen so far
-    
+
     email_degrees  = []
     card_degrees   = []
     device_degrees = []
-    
+
     for _, row in df.iterrows():
         email  = row.get("P_emaildomain")
         card   = str(row.get("card1"))
         device = row.get("DeviceInfo")
-        
-        # Look up how many cards have used this email so far
-        email_degree = len(email_to_cards.get(email, set()))
-        card_degree = len(card_to_emails.get(card, set()))
+
+        email_degree  = len(email_to_cards.get(email, set()))
+        card_degree   = len(card_to_emails.get(card, set()))
         device_degree = len(device_to_cards.get(device, set()))
-        
-        # Append that count to email_degrees
-        email_degrees.append(email_degree)  
+
+        email_degrees.append(email_degree)
         card_degrees.append(card_degree)
         device_degrees.append(device_degree)
-        
-        # Update email_to_cards with the current card
+
         email_to_cards.setdefault(email, set()).add(card)
         card_to_emails.setdefault(card, set()).add(email)
         device_to_cards.setdefault(device, set()).add(card)
-        
+
     df["email_degree"]  = email_degrees
     df["card_degree"]   = card_degrees
     df["device_degree"] = device_degrees

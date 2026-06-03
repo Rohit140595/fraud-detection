@@ -6,9 +6,9 @@ End-to-end ML pipeline for real-time transaction fraud detection, built on the [
 
 | Metric | Score |
 |---|---|
-| **PR-AUC** | **0.5828** |
-| ROC-AUC | 0.9100 |
-| Precision / Recall (F2 threshold) | 0.467 / 0.617 |
+| **PR-AUC** | **0.5861** |
+| ROC-AUC | 0.9163 |
+| Precision / Recall (F2 threshold) | 0.408 / 0.656 |
 | Fraud rate (test set) | 3.44% |
 
 Primary metric is PR-AUC — more informative than ROC-AUC on heavily imbalanced data since it focuses on the minority class and is not inflated by the large number of true negatives.
