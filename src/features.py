@@ -1,12 +1,13 @@
 """
 Feature engineering for real-time fraud detection.
 
-Three core feature families:
+Four core feature families:
   - Velocity        : how many transactions has this user made in the last N seconds?
   - Deviation       : how far is this transaction amount from the user's historical mean?
   - D-col aggregates: expanding mean/std of D1–D9 (days-since features) per user.
+  - Graph           : degree features — distinct cards per email/device (email_degree, card_degree, device_degree)
 
-All three are computed in a leak-free way — only prior transactions are used.
+All four are computed in a leak-free way — only prior transactions are used.
 """
 
 from __future__ import annotations
@@ -562,6 +563,130 @@ def compute_d_uid_aggregates(
     return df
 
 
+def compute_graph_features(
+    df: pd.DataFrame,
+    time_col: str = "TransactionDT",
+) -> pd.DataFrame:
+    """
+    Graph-based features capturing relationships between cards, emails and devices.
+
+    Treats each transaction as an edge in a bipartite graph:
+      card ↔ email  and  card ↔ device
+
+    For each transaction, records the state of the graph *before* the current
+    edge is added — leak-free by construction (same record-before-update pattern
+    as _expanding_nunique).
+
+    Degree features count distinct neighbours seen so far:
+      email_degree  : distinct cards that used this email before this transaction.
+                      High values → shared/compromised email account.
+      card_degree   : distinct emails this card has used before this transaction.
+                      High values → card used across many accounts.
+      device_degree : distinct cards that used this device before this transaction.
+                      High values → device fingerprint shared across many cards.
+
+    Args:
+        df:       DataFrame containing card1, P_emaildomain, DeviceInfo, time_col.
+        time_col: Column with transaction timestamps (rows processed in this order).
+
+    Returns:
+        DataFrame with email_degree, card_degree, and device_degree added.
+    """
+    df = df.sort_values(time_col).copy()
+
+    email_to_cards  = {}   # email  → set of cards seen so far
+    card_to_emails  = {}   # card   → set of emails seen so far
+    device_to_cards = {}   # device → set of cards seen so far
+
+    email_degrees  = []
+    card_degrees   = []
+    device_degrees = []
+
+    for _, row in df.iterrows():
+        email  = row.get("P_emaildomain")
+        card   = str(row.get("card1"))
+        device = row.get("DeviceInfo")
+
+        # Record counts BEFORE updating — leak-free
+        email_degrees.append(len(email_to_cards.get(email, set())))
+        card_degrees.append(len(card_to_emails.get(card, set())))
+        device_degrees.append(len(device_to_cards.get(device, set())))
+
+        # Now update the graph with the current transaction
+        email_to_cards.setdefault(email, set()).add(card)
+        card_to_emails.setdefault(card, set()).add(email)
+        device_to_cards.setdefault(device, set()).add(card)
+
+    df["email_degree"]  = email_degrees
+    df["card_degree"]   = card_degrees
+    df["device_degree"] = device_degrees
+
+    return df
+    
+
+class UnionFind:
+    """
+    Disjoint Set Union (Union-Find) with path compression and union by size.
+
+    Used in compute_graph_features to track connected components across cards,
+    emails, and devices. Two cards belong to the same component if they share
+    an email address or device fingerprint (directly or transitively).
+
+    Two optimisations keep amortised cost near O(1) per operation:
+      - Path compression : find() flattens the path to the root on every lookup,
+                           so future finds on the same node are O(1).
+      - Union by size    : union() always attaches the smaller tree under the
+                           larger one, keeping trees shallow (O(log n) depth
+                           in the worst case, O(α(n)) amortised with compression).
+
+    Nodes are added lazily — calling find() or union() on an unseen node
+    auto-initialises it as its own singleton component (size = 1).
+
+    Methods:
+        find(x)              → root of x's component (with path compression).
+        union(x, y)          → merge the components containing x and y.
+        component_size(x)    → number of nodes in x's component.
+    """
+
+    def __init__(self):
+        self.parent = {}   # node → its parent (itself if root)
+        self.size   = {}   # root → size of its component
+
+    def find(self, x):
+        """Return the root of x's component, compressing the path as a side-effect."""
+        # If x is new, initialise it as its own component
+        if x not in self.parent:
+            self.parent[x] = x
+            self.size[x]   = 1
+        # Follow parent pointers until we reach the root
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])  # path compression
+        return self.parent[x]
+
+    def union(self, x, y):
+        """
+        Merge the components containing x and y (union by size).
+
+        The smaller component's root is attached under the larger component's
+        root so the resulting tree stays as flat as possible.
+        No-op if x and y are already in the same component.
+        """
+        root_x = self.find(x)
+        root_y = self.find(y)
+        if root_x == root_y:
+            return
+        if self.size[root_x] > self.size[root_y]:
+            self.size[root_x] = self.size[root_x] + self.size[root_y]
+            self.parent[root_y] = root_x   # smaller root points to larger root
+        else:
+            self.size[root_y] = self.size[root_x] + self.size[root_y]
+            self.parent[root_x] = root_y   # smaller root points to larger root
+
+    def component_size(self, x):
+        """Return the number of nodes in x's connected component."""
+        return self.size[self.find(x)]
+    
+        
 def merge_identity(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
     """
     Left join identity features onto transactions.
@@ -597,15 +722,16 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
       4.  Add uid (card1 + addr1 + P_emaildomain) — grouping key for time deltas
           and post-split frequency / target encodings; drop after those steps.
       5.  D-column expanding stats — expanding mean/std of D1–D9 per uid (leak-free)
-      6.  Velocity across 1h / 24h / 7d windows (per card_addr)
-      7.  Time deltas — seconds since last transaction per card1 and uid
-      8.  Amount deviation from historical mean
-      9.  Time features (hour of day, day of week, month of year)
-     10.  Card-level unique address and amount counts
-     11.  Email domain features (match flag, free-provider flag)
-     12.  Amount structure features (cents portion, round-number flag)
-     13.  D1–D9 features (log-transform, null flag)
-     14.  Identity features (is_unknown_os, is_mobile, device_os)
+      6.  Graph features — email/card/device degree (leak-free)
+      7.  Velocity across 1h / 24h / 7d windows (per card_addr)
+      8.  Time deltas — seconds since last transaction per card1 and uid
+      9.  Amount deviation from historical mean
+     10.  Time features (hour of day, day of week, month of year)
+     11.  Card-level unique address and amount counts
+     12.  Email domain features (match flag, free-provider flag)
+     13.  Amount structure features (cents portion, round-number flag)
+     14.  D1–D9 features (log-transform, null flag)
+     15.  Identity features (is_unknown_os, is_mobile, device_os)
 
     Note: frequency encodings (uid_freq, card1_freq, etc.) are fit after the
     train/cal/test split to prevent leakage — see the notebook for those steps
@@ -630,6 +756,7 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
     df = add_user_proxy(df)
     df = compute_uid_features(df)           # uid = card1 + addr1 + email
     df = compute_d_uid_aggregates(df)       # expanding D-col mean/std per uid (leak-free)
+    df = compute_graph_features(df)         # email/card/device degree (leak-free)
     df = compute_velocity_multi_window(df)
     df = compute_time_deltas(df)            # dt_card1_last, dt_uid_last
     df = compute_amount_deviation(df)

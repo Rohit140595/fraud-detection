@@ -6,9 +6,9 @@ End-to-end ML pipeline for real-time transaction fraud detection, built on the [
 
 | Metric | Score |
 |---|---|
-| **PR-AUC** | **0.5712** |
-| ROC-AUC | 0.9100 |
-| Precision / Recall (F2 threshold) | 0.436 / 0.614 |
+| **PR-AUC** | **0.5861** |
+| ROC-AUC | 0.9163 |
+| Precision / Recall (F2 threshold) | 0.408 / 0.656 |
 | Fraud rate (test set) | 3.44% |
 
 Primary metric is PR-AUC — more informative than ROC-AUC on heavily imbalanced data since it focuses on the minority class and is not inflated by the large number of true negatives.
@@ -58,6 +58,9 @@ All features in `src/features.py` are computed **leak-free** — only prior tran
 | `is_free_email` | 1 if purchaser uses a free provider (gmail, yahoo, hotmail, etc.) |
 | `amt_cents` | Fractional cents portion of `TransactionAmt` |
 | `is_round_amt` | 1 if transaction amount has no cents |
+| `email_degree` | Distinct cards that used this email before this transaction — high = suspicious |
+| `card_degree` | Distinct emails this card has used before this transaction |
+| `device_degree` | Distinct cards that used this device before this transaction |
 | `dt_card1_last` | Seconds since the previous transaction on the same card1 |
 | `dt_uid_last` | Seconds since the previous transaction for the same UID (card + addr + email) |
 | `uid_D{n}_mean` | Expanding mean of D1–D9 per UID up to but not including the current transaction |

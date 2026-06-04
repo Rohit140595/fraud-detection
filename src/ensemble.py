@@ -185,20 +185,22 @@ def tune_all(
 def train_ensemble(
     X_train: pd.DataFrame,
     y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
+    X_val: pd.DataFrame,      # kept for API compatibility — not used (no early stopping)
+    y_val: pd.Series,         # kept for API compatibility — not used (no early stopping)
     best_params: dict[str, dict],
     cat_cols: list[str],
 ) -> dict[str, object]:
     """
-    Train LightGBM and XGBoost with early stopping on the validation set.
+    Train LightGBM and XGBoost for exactly n_estimators iterations.
 
-    Merges tuned hyperparameters (from tune_all) with sensible defaults, then
-    trains with early_stopping_rounds=50 to prevent overfitting.
+    Merges tuned hyperparameters (from tune_all) with sensible defaults.
+    No early stopping — n_estimators is already tuned by Optuna to the right
+    depth, so early stopping on a noisy validation set would just cut training
+    short and undo the tuning work.
 
     Args:
         X_train, y_train: Training features and labels (integer-encoded).
-        X_val, y_val:     Validation set for early stopping.
+        X_val, y_val:     Validation set for evaluation only (not early stopping).
         best_params:      Output of tune_all().
         cat_cols:         Categorical column names (from encode_for_ensemble).
 
@@ -212,7 +214,7 @@ def train_ensemble(
     # ── LightGBM ──────────────────────────────────────────────────────────────
     print("\nTraining LightGBM ...")
     lgbm_p = {
-        "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 64,
+        "n_estimators": 500, "learning_rate": 0.05, "num_leaves": 64,
         "scale_pos_weight": spw, "bagging_freq": 1,
         "random_state": RANDOM_STATE, "n_jobs": -1,
     }
@@ -221,28 +223,24 @@ def train_ensemble(
     lgbm_p["bagging_freq"]     = 1     # required for bagging_fraction
 
     lgbm_model = lgb.LGBMClassifier(**lgbm_p)
-    fit_kw = {
-        "eval_set": [(X_val, y_val)],
-        "callbacks": [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(100)],
-    }
+    fit_kw = {}
     if cat_cols:
         fit_kw["categorical_feature"] = cat_cols
     lgbm_model.fit(X_train, y_train, **fit_kw)
-    print(f"  Best iteration: {lgbm_model.best_iteration_}")
+    print(f"  Trained {lgbm_model.n_estimators_} trees")
 
     # ── XGBoost ───────────────────────────────────────────────────────────────
     print("\nTraining XGBoost ...")
     xgb_p = {
-        "n_estimators": 1000, "learning_rate": 0.05,
+        "n_estimators": 500, "learning_rate": 0.05,
         "scale_pos_weight": spw, "random_state": RANDOM_STATE, "n_jobs": -1,
-        "verbosity": 0, "eval_metric": "aucpr", "early_stopping_rounds": 50,
+        "verbosity": 0,
     }
     xgb_p.update(best_params.get("xgb", {}))
-    xgb_p["scale_pos_weight"]      = spw
-    xgb_p["early_stopping_rounds"] = 50   # re-enforce after update
+    xgb_p["scale_pos_weight"] = spw
 
     xgb_model = xgb.XGBClassifier(**xgb_p)
-    xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    xgb_model.fit(X_train, y_train)
 
     return {"lgbm": lgbm_model, "xgb": xgb_model}
 
