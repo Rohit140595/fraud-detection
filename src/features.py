@@ -5,7 +5,7 @@ Four core feature families:
   - Velocity        : how many transactions has this user made in the last N seconds?
   - Deviation       : how far is this transaction amount from the user's historical mean?
   - D-col aggregates: expanding mean/std of D1–D9 (days-since features) per user.
-  - Graph           : how many distinct cards share the same email/device? (degree features)
+  - Graph           : degree features — distinct cards per email/device (email_degree, card_degree, device_degree)
 
 All four are computed in a leak-free way — only prior transactions are used.
 """
@@ -569,14 +569,31 @@ def compute_graph_features(
 ) -> pd.DataFrame:
     """
     Graph-based features capturing relationships between cards, emails and devices.
-    
-    Adds:
-        email_degree  : distinct cards that used this email before this transaction
-        card_degree   : distinct emails this card has used before this transaction
-        device_degree : distinct cards that used this device before this transaction
+
+    Treats each transaction as an edge in a bipartite graph:
+      card ↔ email  and  card ↔ device
+
+    For each transaction, records the state of the graph *before* the current
+    edge is added — leak-free by construction (same record-before-update pattern
+    as _expanding_nunique).
+
+    Degree features count distinct neighbours seen so far:
+      email_degree  : distinct cards that used this email before this transaction.
+                      High values → shared/compromised email account.
+      card_degree   : distinct emails this card has used before this transaction.
+                      High values → card used across many accounts.
+      device_degree : distinct cards that used this device before this transaction.
+                      High values → device fingerprint shared across many cards.
+
+    Args:
+        df:       DataFrame containing card1, P_emaildomain, DeviceInfo, time_col.
+        time_col: Column with transaction timestamps (rows processed in this order).
+
+    Returns:
+        DataFrame with email_degree, card_degree, and device_degree added.
     """
     df = df.sort_values(time_col).copy()
-    
+
     email_to_cards  = {}   # email  → set of cards seen so far
     card_to_emails  = {}   # card   → set of emails seen so far
     device_to_cards = {}   # device → set of cards seen so far
@@ -590,14 +607,12 @@ def compute_graph_features(
         card   = str(row.get("card1"))
         device = row.get("DeviceInfo")
 
-        email_degree  = len(email_to_cards.get(email, set()))
-        card_degree   = len(card_to_emails.get(card, set()))
-        device_degree = len(device_to_cards.get(device, set()))
+        # Record counts BEFORE updating — leak-free
+        email_degrees.append(len(email_to_cards.get(email, set())))
+        card_degrees.append(len(card_to_emails.get(card, set())))
+        device_degrees.append(len(device_to_cards.get(device, set())))
 
-        email_degrees.append(email_degree)
-        card_degrees.append(card_degree)
-        device_degrees.append(device_degree)
-
+        # Now update the graph with the current transaction
         email_to_cards.setdefault(email, set()).add(card)
         card_to_emails.setdefault(card, set()).add(email)
         device_to_cards.setdefault(device, set()).add(card)
@@ -605,10 +620,73 @@ def compute_graph_features(
     df["email_degree"]  = email_degrees
     df["card_degree"]   = card_degrees
     df["device_degree"] = device_degrees
-    
+
     return df
     
+
+class UnionFind:
+    """
+    Disjoint Set Union (Union-Find) with path compression and union by size.
+
+    Used in compute_graph_features to track connected components across cards,
+    emails, and devices. Two cards belong to the same component if they share
+    an email address or device fingerprint (directly or transitively).
+
+    Two optimisations keep amortised cost near O(1) per operation:
+      - Path compression : find() flattens the path to the root on every lookup,
+                           so future finds on the same node are O(1).
+      - Union by size    : union() always attaches the smaller tree under the
+                           larger one, keeping trees shallow (O(log n) depth
+                           in the worst case, O(α(n)) amortised with compression).
+
+    Nodes are added lazily — calling find() or union() on an unseen node
+    auto-initialises it as its own singleton component (size = 1).
+
+    Methods:
+        find(x)              → root of x's component (with path compression).
+        union(x, y)          → merge the components containing x and y.
+        component_size(x)    → number of nodes in x's component.
+    """
+
+    def __init__(self):
+        self.parent = {}   # node → its parent (itself if root)
+        self.size   = {}   # root → size of its component
+
+    def find(self, x):
+        """Return the root of x's component, compressing the path as a side-effect."""
+        # If x is new, initialise it as its own component
+        if x not in self.parent:
+            self.parent[x] = x
+            self.size[x]   = 1
+        # Follow parent pointers until we reach the root
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])  # path compression
+        return self.parent[x]
+
+    def union(self, x, y):
+        """
+        Merge the components containing x and y (union by size).
+
+        The smaller component's root is attached under the larger component's
+        root so the resulting tree stays as flat as possible.
+        No-op if x and y are already in the same component.
+        """
+        root_x = self.find(x)
+        root_y = self.find(y)
+        if root_x == root_y:
+            return
+        if self.size[root_x] > self.size[root_y]:
+            self.size[root_x] = self.size[root_x] + self.size[root_y]
+            self.parent[root_y] = root_x   # smaller root points to larger root
+        else:
+            self.size[root_y] = self.size[root_x] + self.size[root_y]
+            self.parent[root_x] = root_y   # smaller root points to larger root
+
+    def component_size(self, x):
+        """Return the number of nodes in x's connected component."""
+        return self.size[self.find(x)]
     
+        
 def merge_identity(trn: pd.DataFrame, idn: pd.DataFrame) -> pd.DataFrame:
     """
     Left join identity features onto transactions.
@@ -644,7 +722,7 @@ def build_features(trn: pd.DataFrame, idn: pd.DataFrame = None) -> pd.DataFrame:
       4.  Add uid (card1 + addr1 + P_emaildomain) — grouping key for time deltas
           and post-split frequency / target encodings; drop after those steps.
       5.  D-column expanding stats — expanding mean/std of D1–D9 per uid (leak-free)
-      6.  Graph features — email/card/device degree (distinct entities seen before)
+      6.  Graph features — email/card/device degree (leak-free)
       7.  Velocity across 1h / 24h / 7d windows (per card_addr)
       8.  Time deltas — seconds since last transaction per card1 and uid
       9.  Amount deviation from historical mean
